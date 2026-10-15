@@ -2,7 +2,7 @@
 
 Final-year research project, BSc Actuarial Science, Jomo Kenyatta University of Agriculture and Technology (JKUAT), Group 4.
 
-📄 **[Read the full thesis (PDF)](thesis/Motor-Insurance-Fraud-Ensemble-Thesis.pdf)**
+📄 **[Read the full thesis (PDF)](Motor-Insurance-Fraud-Ensemble-Thesis.pdf)**
 
 ---
 
@@ -36,7 +36,7 @@ On the held-out test set (3,041 claims):
 - Every improvement is statistically significant (Wilcoxon signed-rank, p < 0.01)
 - On the **Kenyan validation set**, the ensemble held up with F1 = 82.57% and AUC-PR = 0.8743
 
-![Model comparison on the held-out test set](thesis/latex/fig9.png)
+![Model comparison on the held-out test set](fig9.png)
 
 ## Key findings
 
@@ -60,11 +60,11 @@ On the held-out test set (3,041 claims):
 | Vehicle theft fabrication | 26 | 19 | 73.1% |
 | **Total** | **400** | **347** | **86.8%** |
 
-![Detection rate by Kenyan fraud type](thesis/latex/fig13.png)
+![Detection rate by Kenyan fraud type](fig13.png)
 
 **It helps investigators prioritise.** A confidence-scoring layer sorts claims into four tiers by how much the three models agree. Fraud is 67.8% of claims in the "Investigation Required" tier, against 13.2% in "High Confidence". Investigators can focus on the 5.4% of claims most likely to be fraud.
 
-![Fraud prevalence by confidence tier](thesis/latex/fig15.png)
+![Fraud prevalence by confidence tier](fig15.png)
 
 ## Method
 
@@ -86,17 +86,14 @@ On the held-out test set (3,041 claims):
 
 ## Repository contents
 
-```
-├── thesis/
-│   ├── Motor-Insurance-Fraud-Ensemble-Thesis.pdf   # full thesis, 86 pages
-│   └── latex/
-│       ├── main.tex        # LaTeX source
-│       ├── sources.bib     # references (APA, apacite)
-│       └── fig1–fig15.png  # all result figures
-└── README.md
-```
+| File | What it is |
+|---|---|
+| `Motor-Insurance-Fraud-Ensemble-Thesis.pdf` | Full thesis, 86 pages |
+| `main.tex` | LaTeX source of the thesis |
+| `sources.bib` | References (APA, apacite) |
+| `fig1.png` to `fig15.png` | All result figures |
 
-To rebuild the PDF from the `thesis/latex` folder, run `pdflatex main`, then `bibtex main`, then `pdflatex main` twice more.
+To rebuild the PDF, run `pdflatex main`, then `bibtex main`, then `pdflatex main` twice more.
 
 ## Team
 
