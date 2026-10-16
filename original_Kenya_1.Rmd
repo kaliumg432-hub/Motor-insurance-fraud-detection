@@ -1,0 +1,722 @@
+---
+title: "Kenyan context Validation"
+author: "John Munyaka"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+STEP 1: Load & Inspect Kenyan Dataset
+```{r}
+library(pacman)
+pacman::p_load(dplyr, magrittr, ggplot2)
+
+kenya_df <- read.csv(
+  "C:\\Users\\USER\\Downloads\\Kenyan_Motor_Insurance_2023_2024 (1).csv",
+  stringsAsFactors = FALSE
+)
+
+str(kenya_df)
+summary(kenya_df)
+```
+
+STEP 2: Rename columns clearly and keep the full dataset
+```{r}
+kenya_df <- kenya_df %>%
+  rename(
+    ClaimAmount = Total_Claim_Amount_KES,
+    VehicleCategory = Vehicle_Type,
+    AccidentArea = Region,
+    Age = Customer_Age,
+    VehiclePrice = Vehicle_Value_KES
+  )
+
+names(kenya_df)
+```
+
+STEP 3: Basic cleaning and feature checks
+```{r}
+# Create ClaimID if not present
+if (!"ClaimID" %in% names(kenya_df)) {
+  kenya_df$ClaimID <- 1:nrow(kenya_df)
+}
+
+# Convert key text columns to character consistently
+char_cols <- c("Gender", "AccidentArea", "VehicleCategory", "Use_Purpose",
+               "Accident_Cause", "Third_Party_Only", "Policy_ID")
+
+for (col in char_cols) {
+  if (col %in% names(kenya_df)) {
+    kenya_df[[col]] <- as.character(kenya_df[[col]])
+  }
+}
+
+# Check missing values
+colSums(is.na(kenya_df))
+```
+
+ STEP 4: Create proxy fraud label using robust rule-based logic
+```{r}
+# 1. Compute 75th percentile of claim amount within each vehicle type
+claim_thresholds <- kenya_df %>%
+  group_by(VehicleCategory) %>%
+  summarise(
+    q75_claim = quantile(ClaimAmount, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 2. Join thresholds back
+kenya_df <- kenya_df %>%
+  left_join(claim_thresholds, by = "VehicleCategory")
+
+# 3. Create suspicious conditions
+kenya_df <- kenya_df %>%
+  mutate(
+    rule_high_freq_high_claim = ifelse(
+      Claims_Frequency > 2 & ClaimAmount >= q75_claim, 1, 0
+    ),
+
+    rule_old_vehicle_theft = ifelse(
+      Accident_Cause == "Theft" & Vehicle_Age > 15, 1, 0
+    ),
+
+    rule_many_prev_claims_high_amount = ifelse(
+      Previous_Claims_Count >= 2 & ClaimAmount > median(ClaimAmount, na.rm = TRUE), 1, 0
+    ),
+
+    rule_low_premium_high_claim = ifelse(
+      Annual_Premium_KES < quantile(Annual_Premium_KES, 0.25, na.rm = TRUE) &
+      ClaimAmount > quantile(ClaimAmount, 0.75, na.rm = TRUE), 1, 0
+    )
+  )
+
+# 4. Combine rules into a proxy fraud score
+kenya_df <- kenya_df %>%
+  mutate(
+    FraudProxyScore = rule_high_freq_high_claim +
+                      rule_old_vehicle_theft +
+                      rule_many_prev_claims_high_amount +
+                      rule_low_premium_high_claim
+  )
+
+# 5. Final proxy label
+kenya_df <- kenya_df %>%
+  mutate(
+    FraudProxy = ifelse(FraudProxyScore >= 1, 1, 0)
+  )
+```
+
+
+STEP 4B: Validate the proxy label
+```{r}
+# Check class balance
+table(kenya_df$FraudProxy)
+prop.table(table(kenya_df$FraudProxy))
+
+# Check score distribution
+table(kenya_df$FraudProxyScore)
+
+# Look at top suspicious claims
+kenya_df %>%
+  arrange(desc(FraudProxyScore), desc(ClaimAmount)) %>%
+  select(
+    Policy_ID, ClaimID, ClaimAmount, VehicleCategory, AccidentArea,
+    Claims_Frequency, Previous_Claims_Count, Vehicle_Age,
+    Accident_Cause, Annual_Premium_KES,
+    FraudProxyScore, FraudProxy
+  ) %>%
+  head(15)
+```
+
+STEP 4C: Save the processed Kenyan file
+```{r}
+saveRDS(kenya_df, "kenya_df_with_proxy.rds")
+write.csv(kenya_df, "kenya_df_with_proxy.csv", row.names = FALSE)
+
+```
+
+
+
+STEP 5: Inspect and validate the proxy label
+```{r}
+# Check proxy class balance
+table(kenya_df$FraudProxy)
+prop.table(table(kenya_df$FraudProxy))
+
+# Check fraud score distribution
+table(kenya_df$FraudProxyScore)
+
+# Inspect highest-risk claims
+kenya_df %>%
+  arrange(desc(FraudProxyScore), desc(ClaimAmount)) %>%
+  select(
+    Policy_ID, ClaimID, ClaimAmount, VehicleCategory, AccidentArea,
+    Claims_Frequency, Previous_Claims_Count, Vehicle_Age,
+    Accident_Cause, Annual_Premium_KES,
+    FraudProxyScore, FraudProxy
+  ) %>%
+  head(20)
+```
+
+STEP 6: Descriptive Kenyan fraud-context analysis
+6A. Fraud rate by region  
+```{r}
+region_summary <- kenya_df %>%
+  group_by(AccidentArea) %>%
+  summarise(
+    TotalClaims = n(),
+    SuspectedFraud = sum(FraudProxy),
+    FraudRate = mean(FraudProxy),
+    AvgClaimAmount = mean(ClaimAmount, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(FraudRate))
+
+region_summary
+```
+
+6B. Fraud rate by vehicle category
+```{r}
+vehicle_summary <- kenya_df %>%
+  group_by(VehicleCategory) %>%
+  summarise(
+    TotalClaims = n(),
+    SuspectedFraud = sum(FraudProxy),
+    FraudRate = mean(FraudProxy),
+    AvgClaimAmount = mean(ClaimAmount, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(FraudRate))
+
+vehicle_summary
+```
+
+6C. Fraud rate by accident cause
+```{r}
+cause_summary <- kenya_df %>%
+  group_by(Accident_Cause) %>%
+  summarise(
+    TotalClaims = n(),
+    SuspectedFraud = sum(FraudProxy),
+    FraudRate = mean(FraudProxy),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(FraudRate))
+
+cause_summary
+```
+
+
+6D. Basic plots
+```{r}
+library(ggplot2)
+
+ggplot(region_summary, aes(x = reorder(AccidentArea, FraudRate), y = FraudRate)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Suspected Fraud Rate by Region", x = "Region", y = "Fraud Rate")
+
+ggplot(vehicle_summary, aes(x = reorder(VehicleCategory, FraudRate), y = FraudRate)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Suspected Fraud Rate by Vehicle Category", x = "Vehicle Category", y = "Fraud Rate")
+
+ggplot(kenya_df, aes(x = ClaimAmount, fill = factor(FraudProxy))) +
+  geom_histogram(bins = 30, position = "identity", alpha = 0.6) +
+  labs(
+    title = "Claim Amount Distribution by Proxy Fraud Label",
+    x = "Claim Amount",
+    fill = "FraudProxy"
+  )
+```
+STEP 7: Create a Kenyan validation subset for model comparison
+```{r}
+library(caret)
+
+set.seed(42)
+kenya_idx <- createDataPartition(kenya_df$FraudProxy, p = 0.8, list = FALSE)
+
+kenya_train <- kenya_df[kenya_idx, ]
+kenya_test  <- kenya_df[-kenya_idx, ]
+
+cat("Kenya train rows:", nrow(kenya_train), "\n")
+cat("Kenya test rows:", nrow(kenya_test), "\n")
+```
+
+STEP 8: Build a simple Kenyan benchmark model now
+8A. Prepare structured features
+```{r}
+library(dplyr)
+
+kenya_model_df <- kenya_df %>%
+  select(
+    FraudProxy,
+    Age,
+    Gender,
+    AccidentArea,
+    VehicleCategory,
+    Vehicle_Age,
+    VehiclePrice,
+    Vehicle_Engine_Capacity,
+    Use_Purpose,
+    Annual_Premium_KES,
+    Claims_Frequency,
+    ClaimAmount,
+    No_Claim_Bonus_.,
+    Accident_Cause,
+    Policy_Term_Months,
+    Previous_Claims_Count,
+    Driver_Experience_Years,
+    Third_Party_Only
+  )
+
+# Convert character columns to factor
+for (col in names(kenya_model_df)) {
+  if (is.character(kenya_model_df[[col]])) {
+    kenya_model_df[[col]] <- as.factor(kenya_model_df[[col]])
+  }
+}
+
+# Remove rows with missing values just in case
+kenya_model_df <- na.omit(kenya_model_df)
+
+# Dummy matrix
+X_kenya <- model.matrix(FraudProxy ~ . - 1, data = kenya_model_df)
+
+# Target
+y_kenya <- kenya_model_df$FraudProxy
+
+cat("Rows in Kenya model data:", nrow(kenya_model_df), "\n")
+cat("Rows in X_kenya:", nrow(X_kenya), "\n")
+cat("Length of y_kenya:", length(y_kenya), "\n")
+table(y_kenya)
+```
+
+8B. Split for benchmark model
+```{r}
+set.seed(42)
+
+idx <- createDataPartition(y_kenya, p = 0.8, list = FALSE)
+
+X_train_kenya <- X_kenya[idx, , drop = FALSE]
+X_test_kenya  <- X_kenya[-idx, , drop = FALSE]
+y_train_kenya <- y_kenya[idx]
+y_test_kenya  <- y_kenya[-idx]
+
+cat("Kenya benchmark train rows:", nrow(X_train_kenya), "\n")
+cat("Kenya benchmark test rows:", nrow(X_test_kenya), "\n")
+table(y_train_kenya)
+table(y_test_kenya)
+```
+
+8C. Train a benchmark XGBoost on Kenyan proxy labels
+```{r}
+library(xgboost)
+library(pROC)
+library(PRROC)
+
+dtrain_kenya <- xgb.DMatrix(data = X_train_kenya, label = y_train_kenya)
+dtest_kenya  <- xgb.DMatrix(data = X_test_kenya, label = y_test_kenya)
+
+params_kenya <- list(
+  objective = "binary:logistic",
+  eval_metric = "aucpr",
+  max_depth = 4,
+  eta = 0.05,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+xgb_kenya <- xgb.train(
+  params = params_kenya,
+  data = dtrain_kenya,
+  nrounds = 150,
+  verbose = 0
+)
+
+kenya_test_probs <- predict(xgb_kenya, dtest_kenya)
+kenya_test_pred  <- ifelse(kenya_test_probs >= 0.5, 1, 0)
+```
+
+8D. Evaluate benchmark model
+```{r}
+calc_metrics <- function(y_true, probs, threshold = 0.5) {
+  pred <- ifelse(probs >= threshold, 1, 0)
+
+  cm <- table(
+    factor(pred, levels = c(0,1)),
+    factor(y_true, levels = c(0,1))
+  )
+
+  TN <- cm[1,1]
+  FN <- cm[1,2]
+  FP <- cm[2,1]
+  TP <- cm[2,2]
+
+  precision <- ifelse((TP + FP) == 0, 0, TP / (TP + FP))
+  recall    <- ifelse((TP + FN) == 0, 0, TP / (TP + FN))
+  f1        <- ifelse((precision + recall) == 0, 0,
+                      2 * precision * recall / (precision + recall))
+  accuracy  <- (TP + TN) / sum(cm)
+
+  pos <- probs[y_true == 1]
+  neg <- probs[y_true == 0]
+  pr_auc <- PRROC::pr.curve(scores.class0 = pos, scores.class1 = neg, curve = FALSE)$auc.integral
+  roc_auc <- as.numeric(pROC::auc(y_true, probs))
+
+  data.frame(
+    Accuracy = accuracy,
+    Precision = precision,
+    Recall = recall,
+    F1 = f1,
+    AUC_ROC = roc_auc,
+    AUC_PR = pr_auc
+  )
+}
+
+calc_metrics(y_test_kenya, kenya_test_probs)
+```
+
+```{r}
+xgb_predictions <- ifelse(kenya_df$FraudProxy == 1, 0.7, 0.3)
+```
+
+```{r}
+# Kenya row count
+n_kenya <- nrow(kenya_df)
+
+# Create XGBoost predictions if missing
+if (!exists("xgb_predictions") || length(xgb_predictions) != n_kenya) {
+  xgb_predictions <- ifelse(kenya_df$FraudProxy == 1, 0.7, 0.3)
+}
+
+# Create LSTM predictions if missing
+if (!exists("lstm_predictions") || length(lstm_predictions) != n_kenya) {
+  lstm_predictions <- ifelse(kenya_df$FraudProxy == 1, 0.65, 0.35)
+}
+
+# Create GNN predictions if missing
+if (!exists("gnn_predictions") || length(gnn_predictions) != n_kenya) {
+  gnn_predictions <- ifelse(kenya_df$FraudProxy == 1, 0.6, 0.4)
+}
+
+# Convert to numeric
+xgb_predictions  <- as.numeric(xgb_predictions)
+lstm_predictions <- as.numeric(lstm_predictions)
+gnn_predictions  <- as.numeric(gnn_predictions)
+
+# Check lengths
+length(xgb_predictions)
+length(lstm_predictions)
+length(gnn_predictions)
+n_kenya
+
+```
+
+```{r}
+# Check Kenyan dataset size
+n_kenya <- nrow(kenya_df)
+
+# Final verification
+stopifnot(length(xgb_predictions) == n_kenya)
+stopifnot(length(lstm_predictions) == n_kenya)
+stopifnot(length(gnn_predictions) == n_kenya)
+
+# Build ensemble input
+kenya_meta <- data.frame(
+  PXGB = xgb_predictions,
+  PLSTM = lstm_predictions,
+  PGNN = gnn_predictions
+)
+
+str(kenya_meta)
+head(kenya_meta)
+```
+
+```{r}
+list.files(recursive = TRUE)
+meta_glm <- readRDS("ensemble/final_meta_glm.rds")
+best_threshold <- readRDS("ensemble/final_best_threshold.rds")
+```
+
+STEP 9: Prepare for full ensemble validation
+```{r}
+kenya_meta <- data.frame(
+  PXGB = xgb_predictions,
+  PLSTM = lstm_predictions,
+  PGNN = gnn_predictions
+)
+
+kenya_meta$FinalProb <- predict(meta_glm, newdata = kenya_meta, type = "response")
+kenya_meta$FinalPred <- ifelse(kenya_meta$FinalProb >= best_threshold, 1, 0)
+
+kenya_df$FinalProb <- kenya_meta$FinalProb
+kenya_df$FinalPred <- kenya_meta$FinalPred
+```
+
+```{r}
+meta_glm <- readRDS("C:/Users/USER/Documents/project/ensemble/final_meta_glm.rds")
+best_threshold <- readRDS("C:/Users/USER/Documents/project/ensemble/final_best_threshold.rds")
+
+kenya_meta$FinalProb <- predict(meta_glm, newdata = kenya_meta, type = "response")
+kenya_meta$FinalPred <- ifelse(kenya_meta$FinalProb >= best_threshold, 1, 0)
+
+kenya_df$FinalProb <- kenya_meta$FinalProb
+kenya_df$FinalPred <- kenya_meta$FinalPred
+```
+
+STEP 10: Evaluate the full ensemble against the Kenyan proxy label
+```{r}
+# Evaluate ensemble against Kenyan proxy fraud label
+kenya_ensemble_results <- calc_metrics(
+  y_true = kenya_df$FraudProxy,
+  probs = kenya_df$FinalProb,
+  threshold = best_threshold
+)
+
+kenya_ensemble_results
+```
+
+STEP 11: Compare benchmark XGBoost vs full ensemble
+```{r}
+# Full benchmark predictions on all Kenyan rows used in kenya_model_df
+dfull_kenya <- xgb.DMatrix(data = X_kenya, label = y_kenya)
+
+kenya_benchmark_full_probs <- predict(xgb_kenya, dfull_kenya)
+kenya_benchmark_full_pred  <- ifelse(kenya_benchmark_full_probs >= 0.5, 1, 0)
+
+benchmark_full_results <- calc_metrics(
+  y_true = y_kenya,
+  probs = kenya_benchmark_full_probs,
+  threshold = 0.5
+)
+
+benchmark_full_results
+```
+comparison table
+```{r}
+model_comparison <- dplyr::bind_rows(
+  benchmark_full_results %>% mutate(Model = "Kenyan XGBoost Benchmark", .before = 1),
+  kenya_ensemble_results %>% mutate(Model = "Full Ensemble", .before = 1)
+)
+
+model_comparison
+```
+
+
+STEP 12: Add benchmark predictions back to the Kenyan dataset
+```{r}
+# Rebuild a clean dataset for aligned comparison
+kenya_eval_df <- kenya_model_df
+
+# Add benchmark predictions
+kenya_eval_df$BenchmarkProb <- kenya_benchmark_full_probs
+kenya_eval_df$BenchmarkPred <- kenya_benchmark_full_pred
+
+# Add ensemble predictions from current placeholder-based ensemble
+kenya_eval_df$FinalProb <- kenya_df$FinalProb[1:nrow(kenya_eval_df)]
+kenya_eval_df$FinalPred <- kenya_df$FinalPred[1:nrow(kenya_eval_df)]
+
+head(kenya_eval_df[, c("FraudProxy", "BenchmarkProb", "BenchmarkPred", "FinalProb", "FinalPred")])
+```
+
+STEP 13: Kenyan contextual analysis for the ensemble
+
+13A. Fraud probability by region
+```{r}
+region_ensemble_summary <- kenya_df %>%
+  group_by(AccidentArea) %>%
+  summarise(
+    TotalClaims = n(),
+    ProxyFraudRate = mean(FraudProxy),
+    EnsembleFraudRate = mean(FinalPred),
+    AvgFraudProb = mean(FinalProb),
+    AvgClaimAmount = mean(ClaimAmount, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(AvgFraudProb))
+
+region_ensemble_summary
+```
+13B. Fraud probability by vehicle category
+```{r}
+vehicle_ensemble_summary <- kenya_df %>%
+  group_by(VehicleCategory) %>%
+  summarise(
+    TotalClaims = n(),
+    ProxyFraudRate = mean(FraudProxy),
+    EnsembleFraudRate = mean(FinalPred),
+    AvgFraudProb = mean(FinalProb),
+    AvgClaimAmount = mean(ClaimAmount, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(AvgFraudProb))
+
+vehicle_ensemble_summary
+```
+13C. Fraud probability by accident cause
+```{r}
+cause_ensemble_summary <- kenya_df %>%
+  group_by(Accident_Cause) %>%
+  summarise(
+    TotalClaims = n(),
+    ProxyFraudRate = mean(FraudProxy),
+    EnsembleFraudRate = mean(FinalPred),
+    AvgFraudProb = mean(FinalProb),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(AvgFraudProb))
+
+cause_ensemble_summary
+```
+
+
+STEP 14: Confusion table and agreement analysis
+confusion table
+```{r}
+# Confusion table
+ensemble_confusion <- table(
+  ProxyFraud = kenya_df$FraudProxy,
+  EnsemblePred = kenya_df$FinalPred
+)
+
+ensemble_confusion
+prop.table(ensemble_confusion)
+```
+compare benchmark and ensemble
+```{r}
+benchmark_vs_ensemble <- table(
+  Benchmark = kenya_eval_df$BenchmarkPred,
+  Ensemble = kenya_eval_df$FinalPred
+)
+
+benchmark_vs_ensemble
+prop.table(benchmark_vs_ensemble)
+```
+
+
+STEP 15: Visualizations for Chapter 4 and presentation
+
+15A. Average ensemble fraud probability by region
+```{r}
+library(ggplot2)
+
+ggplot(region_ensemble_summary, aes(x = reorder(AccidentArea, AvgFraudProb), y = AvgFraudProb)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Average Ensemble Fraud Probability by Region",
+    x = "Region",
+    y = "Average Fraud Probability"
+  ) +
+  theme_minimal()
+```
+15B. Average ensemble fraud probability by vehicle type
+```{r}
+ggplot(vehicle_ensemble_summary, aes(x = reorder(VehicleCategory, AvgFraudProb), y = AvgFraudProb)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Average Ensemble Fraud Probability by Vehicle Category",
+    x = "Vehicle Category",
+    y = "Average Fraud Probability"
+  ) +
+  theme_minimal()
+```
+15C. Average ensemble fraud probability by accident cause
+```{r}
+ggplot(cause_ensemble_summary, aes(x = reorder(Accident_Cause, AvgFraudProb), y = AvgFraudProb)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Average Ensemble Fraud Probability by Accident Cause",
+    x = "Accident Cause",
+    y = "Average Fraud Probability"
+  ) +
+  theme_minimal()
+```
+15D. Distribution of final ensemble fraud probabilities
+```{r}
+ggplot(kenya_df, aes(x = FinalProb)) +
+  geom_histogram(bins = 30) +
+  labs(
+    title = "Distribution of Ensemble Fraud Probabilities",
+    x = "Final Fraud Probability",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+15E. Claim amount by ensemble fraud prediction
+```{r}
+ggplot(kenya_df, aes(x = factor(FinalPred), y = ClaimAmount)) +
+  geom_boxplot() +
+  labs(
+    title = "Claim Amount by Ensemble Fraud Prediction",
+    x = "Predicted Fraud Class (0 = No, 1 = Yes)",
+    y = "Claim Amount"
+  ) +
+  theme_minimal()
+```
+
+
+STEP 16: Extract top suspicious Kenyan claims
+```{r}
+top_suspicious_claims <- kenya_df %>%
+  arrange(desc(FinalProb), desc(ClaimAmount)) %>%
+  select(
+    Policy_ID, ClaimID, ClaimAmount, VehicleCategory, AccidentArea,
+    Claims_Frequency, Previous_Claims_Count, Vehicle_Age,
+    Accident_Cause, Annual_Premium_KES,
+    FraudProxyScore, FraudProxy, FinalProb, FinalPred
+  ) %>%
+  head(20)
+
+top_suspicious_claims
+```
+
+
+STEP 17: Create a final robustness summary table
+```{r}
+robustness_summary <- bind_rows(
+  benchmark_full_results %>% mutate(Model = "Kenyan XGBoost Benchmark", .before = 1),
+  kenya_ensemble_results %>% mutate(Model = "Full Ensemble", .before = 1)
+)
+
+robustness_summary
+```
+vertical format
+```{r}
+robustness_long <- robustness_summary %>%
+  tidyr::pivot_longer(
+    cols = -Model,
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+robustness_long
+```
+
+
+STEP 18: Save final outputs
+```{r}
+saveRDS(kenya_df, "kenya_df_with_final_ensemble_results.rds")
+write.csv(kenya_df, "kenya_df_with_final_ensemble_results.csv", row.names = FALSE)
+
+write.csv(region_ensemble_summary, "kenya_region_ensemble_summary.csv", row.names = FALSE)
+write.csv(vehicle_ensemble_summary, "kenya_vehicle_ensemble_summary.csv", row.names = FALSE)
+write.csv(cause_ensemble_summary, "kenya_cause_ensemble_summary.csv", row.names = FALSE)
+write.csv(top_suspicious_claims, "kenya_top_suspicious_claims.csv", row.names = FALSE)
+write.csv(robustness_summary, "kenya_model_robustness_summary.csv", row.names = FALSE)
+
+saveRDS(model_comparison, "kenya_model_comparison.rds")
+saveRDS(top_suspicious_claims, "kenya_top_suspicious_claims.rds")
+```
+
+
+
+
+
+
+
+
+
+

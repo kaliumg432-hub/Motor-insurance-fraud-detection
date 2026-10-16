@@ -1,0 +1,607 @@
+---
+title: "LSTM3"
+author: "John Munyaka"
+date: "`r Sys.Date()`"
+output: html_document
+---
+```{r}
+install.packages("rlang")
+
+install.packages(c(
+  "tidyverse",
+  "caret",
+  "tokenizers"
+))
+```
+
+
+Step 1: Load Packages and Environment
+```{r}
+library(pacman)
+
+pacman::p_load(
+  reticulate,
+  tidyverse,
+  caret,
+  tokenizers,
+  keras3,
+  tensorflow
+)
+
+packageVersion("rlang")
+tensorflow::tf_config()
+
+tensorflow::set_random_seed(42)
+
+
+```
+
+
+Step 2: Generate Synthetic Claim Narratives
+```{r}
+# ================================
+# Step 2: Generate narratives
+# ================================
+
+# Load dataset
+df <- read.csv("C:/Users/USER/Desktop/data_set_2_kaggle.csv", stringsAsFactors = FALSE)
+
+
+generate_claim_narrative <- function(row){
+
+incident_type <- row["IncidentType"]
+incident_time <- row["IncidentTime"]
+police_report <- ifelse(row["PoliceReportFiled"] == "Yes","was filed","was not filed")
+witnesses <- ifelse(row["WitnessPresent"] == "Yes","present","absent")
+claim_amount <- row["ClaimAmount"]
+fault <- row["Fault"]
+
+templates_fraud <- list(
+
+paste("The incident occurred",incident_time,"involving a",row["VehicleCategory"],
+"The police report",police_report,"and witnesses were",witnesses,
+"The driver who was at fault according to",fault,
+"reported damages amounting to KES",claim_amount,
+"However the circumstances seemed unusual."),
+
+paste("A",row["VehicleCategory"],"was involved in a",incident_type,
+"at",incident_time,"The claimant aged",row["Age"],
+"with",row["PastNumberOfClaims"],"past claims reported extensive damage",
+"but witness accounts were inconsistent.")
+)
+
+templates_legit <- list(
+
+paste("The",row["VehicleCategory"],"was involved in a",incident_type,
+"at",incident_time,"Police report",police_report,
+"with witnesses",witnesses,"Damage estimate KES",claim_amount,
+"This appears to be a straightforward claim."),
+
+paste("A routine",incident_type,"involving a",row["VehicleCategory"],
+"at",incident_time,"Driver was",fault,
+"with only",row["PastNumberOfClaims"],"past claims",
+"All documentation is consistent.")
+)
+
+if(row["FraudFound"]=="Yes"){
+sample(templates_fraud,1)[[1]]
+}else{
+sample(templates_legit,1)[[1]]
+}
+
+}
+
+set.seed(123)
+
+df$claim_narrative <- apply(df,1,generate_claim_narrative)
+```
+
+
+Step 3: Text preprocessing
+```{r}
+preprocess_text <- function(text_vector,max_len=100){
+
+cleaned <- text_vector %>%
+tolower() %>%
+str_replace_all("[[:punct:]]"," ") %>%
+str_replace_all("[[:digit:]]"," ") %>%
+str_replace_all("\\s+"," ") %>%
+str_trim()
+
+tokens <- tokenize_words(cleaned)
+
+# Vocabulary
+vocab <- sort(table(unlist(tokens)),decreasing=TRUE)
+vocab <- names(vocab)
+
+word_index <- setNames(seq_along(vocab),vocab)
+
+# Convert words to integers
+sequences <- lapply(tokens,function(x){
+sapply(x,function(word) word_index[[word]] %||% 0)
+})
+
+# Padding
+pad_seq <- function(seq,max_len){
+c(seq[1:min(length(seq),max_len)],
+rep(0,max_len-length(seq)))
+}
+
+padded <- t(sapply(sequences,pad_seq,max_len=max_len))
+
+list(
+sequences=padded,
+word_index=word_index
+)
+
+}
+
+text_data <- preprocess_text(df$claim_narrative,100)
+
+X_text <- text_data$sequences
+
+cat("Text matrix dimensions:",dim(X_text))
+```
+
+Step 4: Prepare Target Variable and Split Data
+```{r}
+# ================================
+# Step 4: Train/Test split
+# ================================
+
+y <- ifelse(df$FraudFound=="Yes",1,0)
+
+set.seed(42)
+
+train_index <- createDataPartition(y,p=0.8,list=FALSE)
+
+X_text_train <- X_text[train_index,]
+X_text_test <- X_text[-train_index,]
+
+y_train <- y[train_index]
+y_test <- y[-train_index]
+
+# Save them
+saveRDS(y_train, file = "y_train.rds")
+saveRDS(y_test, file = "y_test.rds")
+cat("✓ Saved y_train.rds (length:", length(y_train), ")\n")
+cat("✓ Saved y_test.rds (length:", length(y_test), ")\n")
+# Class weights
+class_weights <- list(
+
+"0"=(1/sum(y_train==0))*length(y_train)/2,
+"1"=(1/sum(y_train==1))*length(y_train)/2
+
+)
+```
+
+Step 5: Build and Train LSTM Model
+a) Build Model
+```{r}
+max_words <- 10000
+max_len <- 100
+
+lstm_model <- keras_model_sequential(name="LSTM_Fraud_Detector") |>
+
+layer_embedding(
+input_dim=max_words,
+output_dim=128,
+input_length=max_len
+) |>
+
+layer_spatial_dropout_1d(rate=0.3) |>
+
+layer_lstm(
+units=64,
+return_sequences=TRUE,
+dropout=0.3
+) |>
+
+layer_lstm(
+units=32,
+dropout=0.3
+) |>
+
+layer_batch_normalization() |>
+
+layer_dense(
+units=32,
+activation="relu"
+) |>
+
+layer_dropout(rate=0.3) |>
+
+layer_dense(
+units=1,
+activation="sigmoid"
+)
+
+lstm_model |>
+
+compile(
+
+optimizer=optimizer_adam(learning_rate=0.001),
+
+loss="binary_crossentropy",
+
+metrics=c(
+"accuracy",
+metric_precision(),
+metric_recall(),
+metric_auc()
+)
+
+)
+summary(lstm_model)
+```
+
+5.b) Train Model
+```{r}
+callbacks_list <- list(
+
+callback_early_stopping(
+monitor="val_loss",
+patience=10,
+restore_best_weights=TRUE
+),
+
+callback_reduce_lr_on_plateau(
+monitor="val_loss",
+factor=0.5,
+patience=5
+)
+
+)
+
+history <- lstm_model |>
+
+fit(
+
+x=X_text_train,
+y=y_train,
+
+epochs=50,
+batch_size=32,
+
+validation_split=0.2,
+
+callbacks=callbacks_list,
+
+class_weight=class_weights,
+
+shuffle=TRUE,
+
+verbose=1
+
+)
+
+plot(history)
+```
+
+5.c) Evaluate Model
+```{r}
+lstm_model |> evaluate(X_text_test,y_test)
+```
+
+
+#Saving the model
+save_model(lstm_model, "lstm_fraud_model.keras")
+#Loadinng the model later
+best_model <- load_model("lstm_fraud_model.keras")
+
+
+
+Step 6: Generate Attention Mechanism (as in Section 3.4.5.1)
+```{r}
+# Custom attention layer implementation
+layer_attention <- function(inputs) {
+  
+  # Calculate attention scores
+  score <- inputs %>%
+    layer_dense(units = 1, activation = "tanh", use_bias = FALSE) %>%
+    layer_flatten()
+  
+  attention_weights <- score %>% layer_activation(activation = "softmax")
+  
+  # Apply attention weights
+  context_vector <- inputs %>%
+    layer_multiply(list(inputs, attention_weights)) %>%
+    layer_lambda(f = function(x) k_sum(x, axis = 1))
+  
+  return(list(context_vector, attention_weights))
+}
+
+# Build model with attention (optional advanced version)
+build_attention_lstm <- function(max_words, max_len, embedding_dim, lstm_units) {
+  
+  # Input layer
+  input <- layer_input(shape = c(max_len), name = "input")
+  
+  # Embedding
+  embedding <- input %>%
+    layer_embedding(input_dim = max_words, 
+                    output_dim = embedding_dim,
+                    input_length = max_len,
+                    name = "embedding")
+  
+  # Bi-directional LSTM (captures context better)
+  lstm_output <- embedding %>%
+    bidirectional(
+      layer_lstm(units = lstm_units, return_sequences = TRUE)
+    )
+  
+  # Apply attention
+  attention_output <- layer_attention(lstm_output)
+  context_vector <- attention_output[[1]]
+  attention_weights <- attention_output[[2]]
+  
+  # Dense layers
+  output <- context_vector %>%
+    layer_dense(units = 32, activation = "relu") %>%
+    layer_dropout(rate = 0.3) %>%
+    layer_dense(units = 1, activation = "sigmoid", name = "output")
+  
+  model <- keras_model(inputs = input, outputs = output)
+  
+  # Store attention weights as part of model for later extraction
+  model$attention_weights <- keras_model(inputs = input, outputs = attention_weights)
+  
+  return(model)
+}
+```
+
+Step 7: Model Evaluation
+```{r}
+# Make predictions
+y_pred_prob <- predict(lstm_model, X_text_test)
+
+# Convert probabilities to classes
+y_pred_class <- ifelse(y_pred_prob > 0.5, 1, 0)
+
+# Load evaluation libraries
+library(caret)
+
+# Confusion matrix
+conf_matrix <- confusionMatrix(
+  as.factor(y_pred_class),
+  as.factor(y_test)
+)
+
+print(conf_matrix)
+
+# Precision, Recall, F1
+precision <- posPredValue(
+  as.factor(y_pred_class),
+  as.factor(y_test)
+)
+
+recall <- sensitivity(
+  as.factor(y_pred_class),
+  as.factor(y_test)
+)
+
+f1 <- (2 * precision * recall) / (precision + recall)
+
+cat("\n--- LSTM Model Performance ---\n")
+cat("Precision:", round(precision,4), "\n")
+cat("Recall:", round(recall,4), "\n")
+cat("F1 Score:", round(f1,4), "\n")
+
+# ROC and AUC
+library(pROC)
+
+roc_obj <- roc(y_test, as.numeric(y_pred_prob))
+
+auc_value <- auc(roc_obj)
+
+cat("AUC:", round(auc_value,4), "\n")
+
+# Plot ROC Curve
+plot(
+  roc_obj,
+  main = "LSTM ROC Curve",
+  col = "blue"
+)
+```
+
+Step 8:
+a) Define the LSTM model builder
+```{r}
+build_lstm_model <- function(max_words, max_len, embedding_dim, lstm_units){
+
+  model <- keras_model_sequential(name = "LSTM_Fraud_Detector") |>
+
+    layer_embedding(
+      input_dim = max_words,
+      output_dim = embedding_dim,
+      input_length = max_len
+    ) |>
+
+    layer_spatial_dropout_1d(rate = 0.3) |>
+
+    layer_lstm(
+      units = lstm_units,
+      return_sequences = TRUE,
+      dropout = 0.3
+    ) |>
+
+    layer_lstm(
+      units = 32,
+      dropout = 0.3
+    ) |>
+
+    layer_batch_normalization() |>
+
+    layer_dense(
+      units = 32,
+      activation = "relu"
+    ) |>
+
+    layer_dropout(rate = 0.3) |>
+
+    layer_dense(
+      units = 1,
+      activation = "sigmoid"
+    )
+
+  return(model)
+}
+```
+
+
+b) Generate Out-of-Fold Predictions for Ensemble
+```{r}
+# Function to generate OOF predictions
+generate_lstm_oof <- function(X_text, y, n_folds = 5) {
+  
+  set.seed(456)
+  folds <- createFolds(y, k = n_folds, list = TRUE)
+  oof_predictions <- numeric(length(y))
+  
+  for(i in 1:n_folds) {
+    cat("\nProcessing fold", i, "...\n")
+    
+    val_indices <- folds[[i]]
+    train_indices <- setdiff(seq_along(y), val_indices)
+    
+    # Split data
+    X_train_fold <- X_text[train_indices, , drop = FALSE]
+    X_val_fold <- X_text[val_indices, , drop = FALSE]
+    y_train_fold <- y[train_indices]
+    
+    # Build and train model for this fold
+    fold_model <- build_lstm_model(
+      max_words = 10000,
+      max_len = 100,
+      embedding_dim = 128,
+      lstm_units = 64
+    )
+    
+    fold_model %>% compile(
+      optimizer = optimizer_adam(learning_rate = 0.001),
+      loss = "binary_crossentropy",
+      metrics = c("accuracy")
+    )
+    
+    # Train with early stopping
+    history <- fold_model %>% fit(
+      x = X_train_fold,
+      y = y_train_fold,
+      epochs = 30,
+      batch_size = 32,
+      validation_split = 0.1,
+      verbose = 0,
+      callbacks = list(
+        callback_early_stopping(patience = 5, restore_best_weights = TRUE)
+      )
+    )
+    
+    # Predict validation fold
+    oof_predictions[val_indices] <- fold_model %>% predict(X_val_fold)
+  }
+  
+  return(oof_predictions)
+}
+
+# Generate OOF predictions
+lstm_oof_predictions <- generate_lstm_oof(X_text, y)
+
+# Save for ensemble
+saveRDS(lstm_oof_predictions, "lstm_oof_predictions.rds")
+
+# Also generate test predictions using full model
+final_lstm_model <- build_lstm_model(
+  max_words = 10000,
+  max_len = 100,
+  embedding_dim = 128,
+  lstm_units = 64
+)
+
+final_lstm_model %>% compile(
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  loss = "binary_crossentropy",
+  metrics = c("accuracy")
+)
+
+# Train on full data
+history <- final_lstm_model %>% fit(
+  x = X_text,
+  y = y,
+  epochs = 30,
+  batch_size = 32,
+  validation_split = 0.2,
+  verbose = 1
+)
+
+# Save test predictions
+lstm_test_predictions <- final_lstm_model %>% predict(X_text_test)
+saveRDS(lstm_test_predictions, "lstm_test_predictions.rds")
+```
+
+
+Step 9: Interpretability - Attention Visualization
+```{r}
+# Function to visualize attention weights
+visualize_attention <- function(model, tokenizer, text_sample, max_len = 100) {
+  
+  # Preprocess the sample text
+  processed_sample <- preprocess_text(text_sample, max_words = 10000, max_len = max_len)
+  
+  # Get attention weights (requires attention model)
+  attention_weights <- model$attention_weights %>% predict(processed_sample$sequences)
+  
+  # Get words (inverse tokenization)
+  word_index <- tokenizer$word_index
+  index_to_word <- names(word_index)
+  names(index_to_word) <- word_index
+  
+  # Get words from sequence
+  sequence <- processed_sample$sequences[1, ]
+  words <- index_to_word[as.character(sequence[sequence > 0])]
+  
+  # Create attention dataframe
+  attention_df <- data.frame(
+    word = words,
+    attention = attention_weights[1, 1:length(words)]
+  )
+  
+  # Plot
+  ggplot(attention_df, aes(x = reorder(word, attention), y = attention)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    coord_flip() +
+    labs(title = "Attention Weights for Claim Narrative",
+         x = "Words", y = "Attention Score") +
+    theme_minimal()
+}
+
+# Example usage
+# visualize_attention(final_lstm_model, text_data$tokenizer, df$claim_narrative[1])
+```
+
+Step 10: Documentation for Proposal Section 3.3.1.2
+### 3.3.1.2 LSTM Implementation Summary
+
+**Model Architecture:**
+- Embedding dimension: 128
+- Two stacked LSTM layers (64 and 32 units)
+- Bi-directional option for enhanced context capture
+- Dropout rate: 0.3 for regularization
+- Output: Sigmoid activation for binary classification
+
+**Training Configuration:**
+- Optimizer: Adam with learning rate 0.001
+- Loss function: Binary crossentropy
+- Class weights: Applied to handle imbalance
+- Early stopping: Patience of 10 epochs
+- Batch size: 32
+
+**Text Preprocessing:**
+- Vocabulary size: 10,000 words
+- Maximum sequence length: 100 tokens
+- Stop words removed
+- Padding: Post-padding to ensure uniform length
+
+**Performance Metrics:**
+- Precision, Recall, F1-Score (primary metrics)
+- AUC-ROC and AUC-PR for imbalanced evaluation
+

@@ -1,0 +1,482 @@
+---
+title: "Final_Meta_Learner_Improved"
+author: "Group 4"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(pacman)
+pacman::p_load(
+  tidyverse,
+  caret,
+  pROC,
+  PRROC,
+  glmnet,
+  randomForest,
+  xgboost,
+  ggplot2,
+  corrplot,
+  boot,
+  broom
+)
+
+set.seed(42)
+options(scipen = 999)
+
+cat("✓ Packages loaded\n")
+```
+Fixing Project Paths
+```{r}
+project_dir <- "C:/Users/USER/Documents/project"
+pred_dir <- file.path(project_dir, "predictions")
+ens_dir  <- file.path(project_dir, "ensemble")
+
+dir.create(pred_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(ens_dir, showWarnings = FALSE, recursive = TRUE)
+
+cat("Predictions folder:", pred_dir, "\n")
+cat("Ensemble folder:", ens_dir, "\n")
+```
+
+
+Step 1: Helper functions
+```{r}
+safe_auc <- function(y_true, probs) {
+  if (length(unique(y_true)) < 2) return(NA_real_)
+  as.numeric(pROC::auc(y_true, probs))
+}
+
+safe_pr_auc <- function(y_true, probs) {
+  pos <- probs[y_true == 1]
+  neg <- probs[y_true == 0]
+  if (length(pos) == 0 || length(neg) == 0) return(NA_real_)
+  pr <- PRROC::pr.curve(scores.class0 = pos, scores.class1 = neg, curve = FALSE)
+  as.numeric(pr$auc.integral)
+}
+
+calc_metrics <- function(y_true, probs, threshold = 0.5) {
+  pred <- ifelse(probs >= threshold, 1, 0)
+
+  cm <- table(
+    factor(pred, levels = c(0,1)),
+    factor(y_true, levels = c(0,1))
+  )
+
+  TN <- cm[1,1]
+  FN <- cm[1,2]
+  FP <- cm[2,1]
+  TP <- cm[2,2]
+
+  precision <- ifelse((TP + FP) == 0, 0, TP / (TP + FP))
+  recall    <- ifelse((TP + FN) == 0, 0, TP / (TP + FN))
+  f1        <- ifelse((precision + recall) == 0, 0,
+                      2 * precision * recall / (precision + recall))
+  accuracy  <- (TP + TN) / sum(cm)
+  specificity <- ifelse((TN + FP) == 0, 0, TN / (TN + FP))
+  bal_acc <- (recall + specificity) / 2
+
+  tibble(
+    Accuracy = accuracy,
+    Precision = precision,
+    Recall = recall,
+    F1 = f1,
+    Specificity = specificity,
+    BalancedAccuracy = bal_acc,
+    AUC_ROC = safe_auc(y_true, probs),
+    AUC_PR = safe_pr_auc(y_true, probs)
+  )
+}
+
+find_best_threshold <- function(y_true, probs) {
+  thresholds <- seq(0.05, 0.95, by = 0.01)
+
+  results <- map_dfr(thresholds, function(t) {
+    calc_metrics(y_true, probs, threshold = t) %>%
+      mutate(Threshold = t, .before = 1)
+  })
+
+  best <- results %>%
+    arrange(desc(F1), desc(Recall), desc(Precision)) %>%
+    slice(1)
+
+  list(best_threshold = best$Threshold, full_table = results, best_row = best)
+}
+
+brier_score <- function(y_true, probs) {
+  mean((probs - y_true)^2)
+}
+
+q_stat <- function(pred1, pred2, y_true, thr = 0.5) {
+  
+  # Remove NA values first (CRITICAL)
+  valid_idx <- which(!is.na(pred1) & !is.na(pred2) & !is.na(y_true))
+  
+  pred1 <- pred1[valid_idx]
+  pred2 <- pred2[valid_idx]
+  y_true <- y_true[valid_idx]
+  
+  # Convert to binary
+  p1 <- ifelse(pred1 >= thr, 1, 0)
+  p2 <- ifelse(pred2 >= thr, 1, 0)
+  
+  c1 <- (p1 == y_true)
+  c2 <- (p2 == y_true)
+  
+  N11 <- sum(c1 & c2, na.rm = TRUE)
+  N00 <- sum(!c1 & !c2, na.rm = TRUE)
+  N10 <- sum(c1 & !c2, na.rm = TRUE)
+  N01 <- sum(!c1 & c2, na.rm = TRUE)
+  
+  denom <- (N11 * N00 + N10 * N01)
+  
+  # 🔥 FIX: handle NA OR zero denominator
+  if (is.na(denom) || denom == 0) return(NA_real_)
+  
+  (N11 * N00 - N10 * N01) / denom
+
+}
+```
+
+
+Step 2: Load original dataset and existing OOF files
+```{r}
+# Original full dataset
+df_original  <- read.csv("C:/Users/USER/Desktop/data_set_2_kaggle.csv", stringsAsFactors = FALSE)
+
+# Create ClaimID if not already present
+if (!"ClaimID" %in% names(df_original)) {
+  df_original$ClaimID <- 1:nrow(df_original)
+}
+
+# Binary target
+df_original$FraudFound <- ifelse(df_original$FraudFound == "Yes", 1, 0)
+
+# Existing saved OOF files from your base model scripts
+xgb_oof  <- readRDS("C:\\Users\\USER\\Documents\\project\\xgb_oof_aligned.rds")
+lstm_oof <- readRDS("C:\\Users\\USER\\Documents\\project\\predictions\\lstm_oof_predictions.rds")
+gnn_oof  <- readRDS("C:\\Users\\USER\\Documents\\project\\predictions\\gnn_oof_predictions.rds")
+
+# Optional target file from LSTM script
+if (file.exists(file.path(pred_dir, "y_full.rds"))) {
+  y_full <- readRDS(file.path(pred_dir, "y_full.rds"))
+} else {
+  y_full <- df_original$FraudFound
+}
+
+cat("✓ Existing OOF files loaded\n")
+cat("XGBoost OOF length:", length(xgb_oof), "\n")
+cat("LSTM OOF length:", length(lstm_oof), "\n")
+cat("GNN OOF length:", length(gnn_oof), "\n")
+cat("Target length:", length(y_full), "\n")
+```
+
+Step 3: Alignment checks
+```{r}
+stopifnot(length(xgb_oof)  == nrow(df_original))
+stopifnot(length(lstm_oof) == nrow(df_original))
+stopifnot(length(gnn_oof)  == nrow(df_original))
+stopifnot(length(y_full)   == nrow(df_original))
+
+meta_df <- data.frame(
+  ClaimID = df_original$ClaimID,
+  FraudFound = y_full,
+  PXGB = as.numeric(xgb_oof),
+  PLSTM = as.numeric(lstm_oof),
+  PGNN = as.numeric(gnn_oof)
+)
+
+cat("Rows before NA removal:", nrow(meta_df), "\n")
+
+meta_df <- meta_df %>%
+  filter(
+    !is.na(FraudFound),
+    !is.na(PXGB),
+    !is.na(PLSTM),
+    !is.na(PGNN)
+  )
+
+cat("Rows after NA removal:", nrow(meta_df), "\n")
+```
+
+Step 4: Basic sanity checks
+```{r}
+summary(meta_df[, c("PXGB", "PLSTM", "PGNN")])
+
+stopifnot(all(meta_df$PXGB >= 0 & meta_df$PXGB <= 1))
+stopifnot(all(meta_df$PLSTM >= 0 & meta_df$PLSTM <= 1))
+stopifnot(all(meta_df$PGNN >= 0 & meta_df$PGNN <= 1))
+
+cat("✓ Prediction values are valid probabilities\n")
+```
+
+Step 5: Correlation and diversity analysis
+```{r}
+cor_matrix <- cor(meta_df[, c("PXGB", "PLSTM", "PGNN")])
+print(cor_matrix)
+
+corrplot(cor_matrix, method = "number", type = "upper", tl.col = "black")
+
+q_results <- tibble(
+  Pair = c("XGB-LSTM", "XGB-GNN", "LSTM-GNN"),
+  Q_Statistic = c(
+    q_stat(meta_df$PXGB, meta_df$PLSTM, meta_df$FraudFound),
+    q_stat(meta_df$PXGB, meta_df$PGNN, meta_df$FraudFound),
+    q_stat(meta_df$PLSTM, meta_df$PGNN, meta_df$FraudFound)
+  )
+)
+
+print(q_results)
+```
+
+Step 6: Train-test split at meta level
+```{r}
+set.seed(42)
+
+train_idx <- createDataPartition(meta_df$FraudFound, p = 0.8, list = FALSE)
+
+train_df <- meta_df[train_idx, ]
+test_df  <- meta_df[-train_idx, ]
+
+cat("Meta-train rows:", nrow(train_df), "\n")
+cat("Meta-test rows:", nrow(test_df), "\n")
+```
+
+Step 7: Train meta-learners
+
+A) Primary model: Logistic Regression
+```{r}
+meta_glm <- glm(
+  FraudFound ~ PXGB + PLSTM + PGNN,
+  data = train_df,
+  family = binomial()
+)
+
+summary(meta_glm)
+
+coef_table <- broom::tidy(meta_glm) %>%
+  mutate(OddsRatio = exp(estimate))
+
+coef_table
+```
+
+B) Alternative model: Random Forest
+```{r}
+meta_rf <- randomForest(
+  x = train_df[, c("PXGB", "PLSTM", "PGNN")],
+  y = factor(train_df$FraudFound),
+  ntree = 500,
+  mtry = 2,
+  importance = TRUE
+)
+
+print(meta_rf)
+importance(meta_rf)
+```
+
+C) Alternative model: XGBoost meta-learner
+```{r}
+dtrain_meta <- xgb.DMatrix(
+  data = as.matrix(train_df[, c("PXGB", "PLSTM", "PGNN")]),
+  label = train_df$FraudFound
+)
+
+params_meta <- list(
+  objective = "binary:logistic",
+  eval_metric = "aucpr",
+  eta = 0.05,
+  max_depth = 2,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  min_child_weight = 2
+)
+
+meta_xgb <- xgb.train(
+  params = params_meta,
+  data = dtrain_meta,
+  nrounds = 100,
+  verbose = 0
+)
+
+```
+
+Step 8: Weighted average benchmark
+```{r}
+weight_grid <- expand.grid(
+  w1 = seq(0, 1, by = 0.05),
+  w2 = seq(0, 1, by = 0.05)
+) %>%
+  mutate(w3 = 1 - w1 - w2) %>%
+  filter(w3 >= 0)
+
+weight_grid$AUC_PR <- pmap_dbl(
+  list(weight_grid$w1, weight_grid$w2, weight_grid$w3),
+  function(w1, w2, w3) {
+    probs <- w1 * train_df$PXGB + w2 * train_df$PLSTM + w3 * train_df$PGNN
+    safe_pr_auc(train_df$FraudFound, probs)
+  }
+)
+
+best_weights <- weight_grid %>%
+  arrange(desc(AUC_PR)) %>%
+  slice(1)
+
+print(best_weights)
+```
+
+Step 9: Predict on meta test set
+```{r}
+test_preds <- test_df %>%
+  transmute(
+    ClaimID,
+    FraudFound,
+    PXGB,
+    PLSTM,
+    PGNN,
+    LogisticStack = predict(meta_glm, newdata = test_df, type = "response"),
+    RandomForestStack = predict(meta_rf, newdata = test_df[, c("PXGB", "PLSTM", "PGNN")],
+                                type = "prob")[,2],
+    XGBoostStack = predict(
+      meta_xgb,
+      newdata = xgb.DMatrix(as.matrix(test_df[, c("PXGB", "PLSTM", "PGNN")]))
+    ),
+    WeightedAverage = best_weights$w1 * PXGB + best_weights$w2 * PLSTM + best_weights$w3 * PGNN,
+    SimpleAverage = (PXGB + PLSTM + PGNN) / 3
+  )
+
+head(test_preds)
+```
+Step 10: Tune threshold for logistic stack
+```{r}
+train_glm_probs <- predict(meta_glm, newdata = train_df, type = "response")
+
+threshold_info <- find_best_threshold(train_df$FraudFound, train_glm_probs)
+best_threshold <- threshold_info$best_threshold
+
+threshold_info$best_row
+cat("Best threshold for LogisticStack:", best_threshold, "\n")
+```
+
+Step 11: Evaluate all models
+```{r}
+model_names <- c(
+  "PXGB", "PLSTM", "PGNN",
+  "LogisticStack", "RandomForestStack", "XGBoostStack",
+  "WeightedAverage", "SimpleAverage"
+)
+
+evaluation_results <- map_dfr(model_names, function(m) {
+  threshold_to_use <- ifelse(m == "LogisticStack", best_threshold, 0.5)
+
+  calc_metrics(
+    y_true = test_preds$FraudFound,
+    probs = test_preds[[m]],
+    threshold = threshold_to_use
+  ) %>%
+    mutate(Model = m, .before = 1)
+})
+
+evaluation_results %>%
+  arrange(desc(AUC_PR), desc(Recall), desc(F1))
+```
+
+Step 12: ROC and PR curves
+```{r}
+# ROC
+roc_list <- lapply(model_names, function(m) {
+  roc(test_preds$FraudFound, test_preds[[m]], quiet = TRUE)
+})
+names(roc_list) <- model_names
+
+plot(roc_list[[1]], main = "ROC Curves - Meta Learner Comparison")
+for (i in 2:length(roc_list)) {
+  plot(roc_list[[i]], add = TRUE)
+}
+legend("bottomright", legend = model_names, cex = 0.7)
+
+# PR
+plot(NULL, xlim = c(0,1), ylim = c(0,1),
+     xlab = "Recall", ylab = "Precision",
+     main = "Precision-Recall Curves - Meta Learner Comparison")
+
+for (m in model_names) {
+  pos <- test_preds[[m]][test_preds$FraudFound == 1]
+  neg <- test_preds[[m]][test_preds$FraudFound == 0]
+  pr <- pr.curve(scores.class0 = pos, scores.class1 = neg, curve = TRUE)
+  lines(pr$curve[,1], pr$curve[,2])
+}
+legend("topright", legend = model_names, cex = 0.7)
+```
+
+Step 13: Calibration check
+```{r}
+cat("Brier Score - LogisticStack:",
+    brier_score(test_preds$FraudFound, test_preds$LogisticStack), "\n")
+```
+
+Step 14: Statistical comparison
+```{r}
+base_results <- evaluation_results %>%
+  filter(Model %in% c("PXGB", "PLSTM", "PGNN")) %>%
+  arrange(desc(AUC_PR), desc(Recall), desc(F1))
+
+best_base <- base_results$Model[1]
+cat("Best base model:", best_base, "\n")
+
+roc_stack <- roc(test_preds$FraudFound, test_preds$LogisticStack, quiet = TRUE)
+roc_base  <- roc(test_preds$FraudFound, test_preds[[best_base]], quiet = TRUE)
+
+delong_test <- roc.test(roc_stack, roc_base, method = "delong")
+print(delong_test)
+
+```
+
+Step 15: Ablation analysis
+```{r}
+fit_ablation <- function(train_df, test_df, features) {
+  form <- as.formula(
+    paste("FraudFound ~", paste(features, collapse = " + "))
+  )
+
+  model <- glm(form, data = train_df, family = binomial())
+
+  train_probs <- predict(model, newdata = train_df, type = "response")
+  best_thr <- find_best_threshold(train_df$FraudFound, train_probs)$best_threshold
+
+  test_probs <- predict(model, newdata = test_df, type = "response")
+
+  calc_metrics(test_df$FraudFound, test_probs, threshold = best_thr) %>%
+    mutate(Features = paste(features, collapse = " + "), .before = 1)
+}
+
+ablation_results <- bind_rows(
+  fit_ablation(train_df, test_df, c("PXGB", "PLSTM")),
+  fit_ablation(train_df, test_df, c("PXGB", "PGNN")),
+  fit_ablation(train_df, test_df, c("PLSTM", "PGNN")),
+  fit_ablation(train_df, test_df, c("PXGB", "PLSTM", "PGNN"))
+)
+
+ablation_results %>%
+  arrange(desc(AUC_PR), desc(Recall), desc(F1))
+```
+
+Step 16: Save final outputs
+```{r}
+saveRDS(meta_glm, file.path(ens_dir, "final_meta_glm.rds"))
+saveRDS(meta_rf, file.path(ens_dir, "final_meta_rf.rds"))
+saveRDS(meta_xgb, file.path(ens_dir, "final_meta_xgb.rds"))
+saveRDS(best_weights, file.path(ens_dir, "final_best_weights.rds"))
+saveRDS(best_threshold, file.path(ens_dir, "final_best_threshold.rds"))
+
+saveRDS(evaluation_results, file.path(ens_dir, "final_evaluation_results.rds"))
+saveRDS(ablation_results, file.path(ens_dir, "final_ablation_results.rds"))
+saveRDS(test_preds, file.path(ens_dir, "final_test_predictions.rds"))
+saveRDS(cor_matrix, file.path(ens_dir, "final_prediction_correlation.rds"))
+
+cat("✓ Final ensemble outputs saved in:\n")
+cat(ens_dir, "\n")
+```
+```{r}
+list.files(ens_dir)
+```
+

@@ -1,0 +1,931 @@
+---
+title: "Kenyan Contextual Validation of the Fraud Detection Ensemble"
+author: "Group 4"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(pacman)
+pacman::p_load(
+  dplyr, magrittr, ggplot2, caret, xgboost, Matrix, pROC, PRROC,
+  keras3, tensorflow, reticulate, fastDummies, readr, tibble, stringr
+)
+
+set.seed(42)
+tensorflow::set_random_seed(42)
+
+options(scipen = 999)
+```
+
+File Paths
+```{r}
+kenya_data_path <- "C:\\Users\\USER\\Downloads\\Kenyan_Motor_Insurance_2023_2024 (1).csv"
+kaggle_data_path <- "C:\\Users\\USER\\Desktop\\data_set_2_kaggle.csv"
+
+xgb_model_path <- "C:\\Users\\USER\\Documents\\project\\xgboost_fraud_model.json"
+xgb_artifacts_path <- "C:\\Users\\USER\\Documents\\project\\fraud_model_artifacts.rds"
+
+lstm_model_path <-
+"C:\\Users\\USER\\Documents\\project\\lstm_fraud_model.keras"
+
+meta_glm_path <- "C:\\Users\\USER\\Documents\\project\\ensemble\\final_meta_glm.rds"
+best_threshold_path <-"C:\\Users\\USER\\Documents\\project\\ensemble\\final_best_threshold.rds"
+```
+
+Helper Functions
+```{r}
+mode_value <- function(x) {
+  ux <- unique(x[!is.na(x)])
+  if (length(ux) == 0) return(NA)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+safe_char <- function(x, default = "Unknown") {
+  x <- as.character(x)
+  x[is.na(x) | trimws(x) == ""] <- default
+  x
+}
+
+safe_num <- function(x, default = 0) {
+  x <- suppressWarnings(as.numeric(x))
+  x[is.na(x) | is.infinite(x)] <- default
+  x
+}
+
+calc_metrics <- function(y_true, probs, threshold = 0.5) {
+  pred <- ifelse(probs >= threshold, 1, 0)
+
+  cm <- table(
+    factor(pred, levels = c(0, 1)),
+    factor(y_true, levels = c(0, 1))
+  )
+
+  TN <- cm[1,1]
+  FN <- cm[1,2]
+  FP <- cm[2,1]
+  TP <- cm[2,2]
+
+  precision <- ifelse((TP + FP) == 0, 0, TP / (TP + FP))
+  recall    <- ifelse((TP + FN) == 0, 0, TP / (TP + FN))
+  f1         <- ifelse((precision + recall) == 0, 0, 2 * precision * recall / (precision + recall))
+  accuracy   <- (TP + TN) / sum(cm)
+
+  pos <- probs[y_true == 1]
+  neg <- probs[y_true == 0]
+
+  roc_auc <- if (length(unique(y_true)) == 2) as.numeric(pROC::auc(y_true, probs)) else NA_real_
+  pr_auc  <- if (length(pos) > 0 && length(neg) > 0) {
+    PRROC::pr.curve(scores.class0 = pos, scores.class1 = neg, curve = FALSE)$auc.integral
+  } else {
+    NA_real_
+  }
+
+  data.frame(
+    Accuracy = accuracy,
+    Precision = precision,
+    Recall = recall,
+    F1 = f1,
+    AUC_ROC = roc_auc,
+    AUC_PR = pr_auc
+  )
+}
+
+make_kaggle_style_narrative <- function(df) {
+  apply(df, 1, function(row) {
+    paste(
+      "Claim filed for a", row[["Make"]],
+      row[["VehicleCategory"]],
+      "under", row[["BasePolicy"]], "policy.",
+      "Accident area:", row[["AccidentArea"]], ".",
+      "Driver age:", row[["Age"]], ".",
+      "Driver sex:", row[["Sex"]], ".",
+      "Marital status:", row[["MaritalStatus"]], ".",
+      "Fault category:", row[["Fault"]], ".",
+      "Claim amount:", row[["ClaimAmount"]], ".",
+      "Vehicle price:", row[["VehiclePrice"]], ".",
+      "Deductible:", row[["Deductible"]], ".",
+      "Driver rating:", row[["DriverRating"]], ".",
+      "Past claims:", row[["PastNumberOfClaims"]], ".",
+      "Police report filed:", row[["PoliceReportFiled"]], ".",
+      "Witness present:", row[["WitnessPresent"]], ".",
+      "Agent type:", row[["AgentType"]], ".",
+      "Number of supplements:", row[["NumberOfSuppliments"]], ".",
+      "Address change claim:", row[["AddressChange.Claim"]], ".",
+      "Number of cars:", row[["NumberOfCars"]], ".",
+      "Month of accident:", row[["Month"]], ".",
+      "Week of month:", row[["WeekOfMonth"]], ".",
+      "Day of week:", row[["DayOfWeek"]], ".",
+      "Month claimed:", row[["MonthClaimed"]], ".",
+      "Week claimed:", row[["WeekOfMonthClaimed"]], ".",
+      "Days policy accident:", row[["Days.Policy.Accident"]], ".",
+      "Days policy claim:", row[["Days.Policy.Claim"]], "."
+    )
+  })
+}
+fix_single_level_factors <- function(df) {
+  df[] <- lapply(df, function(col) {
+    if (is.character(col)) col <- as.factor(col)
+    if (is.factor(col)) {
+      col <- droplevels(col)
+      if (nlevels(col) < 2) {
+        return(NULL)
+      }
+    }
+    col
+  })
+  df <- df[, !sapply(df, is.null), drop = FALSE]
+  df
+}
+```
+
+3. Load and Inspect Kenyan Dataset
+```{r}
+kenya_df <- read.csv(kenya_data_path, stringsAsFactors = FALSE)
+
+cat("Dimensions of Kenyan dataset:", dim(kenya_df), "\n")
+str(kenya_df)
+summary(kenya_df)
+```
+4. Rename Key Variables
+```{r}
+kenya_df <- kenya_df %>%
+  rename(
+    ClaimAmount = Total_Claim_Amount_KES,
+    VehicleCategory = Vehicle_Type,
+    AccidentArea = Region,
+    Age = Customer_Age,
+    VehiclePrice = Vehicle_Value_KES
+  )
+```
+5. Basic Cleaning and Standardization
+```{r}
+if (!"ClaimID" %in% names(kenya_df)) {
+  kenya_df$ClaimID <- paste0("KEN_", seq_len(nrow(kenya_df)))
+}
+
+char_cols <- names(kenya_df)[sapply(kenya_df, is.character)]
+if (length(char_cols) > 0) {
+  kenya_df[char_cols] <- lapply(kenya_df[char_cols], safe_char)
+}
+
+num_cols <- names(kenya_df)[sapply(kenya_df, function(x) is.numeric(x) || is.integer(x))]
+if (length(num_cols) > 0) {
+  kenya_df[num_cols] <- lapply(kenya_df[num_cols], safe_num)
+}
+
+colSums(is.na(kenya_df))
+```
+
+6. Create Contextual Fraud Proxy
+```{r}
+# Rule-based suspicious patterns for Kenyan contextual validation
+kenya_df <- kenya_df %>%
+  mutate(
+    Previous_Claims_Count = if ("Previous_Claims_Count" %in% names(.)) safe_num(Previous_Claims_Count) else 0,
+    Vehicle_Age = if ("Vehicle_Age" %in% names(.)) safe_num(Vehicle_Age) else 0,
+    Monthly_Premium_KES = if ("Monthly_Premium_KES" %in% names(.)) safe_num(Monthly_Premium_KES) else 0,
+    Accident_Cause = if ("Accident_Cause" %in% names(.)) safe_char(Accident_Cause) else "Unknown"
+  )
+
+kenya_df <- kenya_df %>%
+  mutate(
+    rule_high_freq_high_claim =
+      ifelse(Previous_Claims_Count >= 3 & ClaimAmount >= quantile(ClaimAmount, 0.75, na.rm = TRUE), 1, 0),
+
+    rule_old_vehicle_theft =
+      ifelse(Vehicle_Age >= 8 &
+               str_detect(tolower(Accident_Cause), "theft|stolen"), 1, 0),
+
+    rule_many_claims_large_amount =
+      ifelse(Previous_Claims_Count >= 2 & ClaimAmount >= quantile(ClaimAmount, 0.80, na.rm = TRUE), 1, 0),
+
+    rule_low_premium_high_claim =
+      ifelse(Monthly_Premium_KES > 0 &
+               ClaimAmount / Monthly_Premium_KES >= 40, 1, 0)
+  )
+
+kenya_df <- kenya_df %>%
+  mutate(
+    FraudProxyScore = rule_high_freq_high_claim +
+      rule_old_vehicle_theft +
+      rule_many_claims_large_amount +
+      rule_low_premium_high_claim,
+    FraudProxy = ifelse(FraudProxyScore >= 1, 1, 0)
+  )
+
+table(kenya_df$FraudProxy)
+summary(kenya_df$FraudProxyScore)
+```
+
+7. Save Proxy-Labeled Kenyan Data
+```{r}
+saveRDS(kenya_df, "kenya_df_with_proxy.rds")
+write.csv(kenya_df, "kenya_df_with_proxy.csv", row.names = FALSE)
+```
+
+8. Contextual Descriptive Analysis
+```{r}
+fraud_by_region <- kenya_df %>%
+  group_by(AccidentArea) %>%
+  summarise(
+    TotalClaims = n(),
+    FraudRate = mean(FraudProxy, na.rm = TRUE)
+  ) %>%
+  arrange(desc(FraudRate))
+
+fraud_by_vehicle <- kenya_df %>%
+  group_by(VehicleCategory) %>%
+  summarise(
+    TotalClaims = n(),
+    FraudRate = mean(FraudProxy, na.rm = TRUE)
+  ) %>%
+  arrange(desc(FraudRate))
+
+fraud_by_cause <- kenya_df %>%
+  group_by(Accident_Cause) %>%
+  summarise(
+    TotalClaims = n(),
+    FraudRate = mean(FraudProxy, na.rm = TRUE)
+  ) %>%
+  arrange(desc(FraudRate))
+
+fraud_by_region
+fraud_by_vehicle
+fraud_by_cause
+```
+
+```{r}
+ggplot(fraud_by_region, aes(x = reorder(AccidentArea, FraudRate), y = FraudRate)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Fraud Proxy Rate by Region", x = "Region", y = "Fraud Proxy Rate")
+```
+```{r}
+ggplot(fraud_by_vehicle, aes(x = reorder(VehicleCategory, FraudRate), y = FraudRate)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Fraud Proxy Rate by Vehicle Category", x = "Vehicle Category", y = "Fraud Proxy Rate")
+```
+```{r}
+ggplot(kenya_df, aes(x = factor(FraudProxy), y = ClaimAmount)) +
+  geom_boxplot() +
+  labs(title = "Claim Amount by Fraud Proxy Status", x = "Fraud Proxy", y = "Claim Amount")
+```
+
+9. Split Kenyan Data for Local Benchmark Model
+```{r}
+train_idx <- createDataPartition(kenya_df$FraudProxy, p = 0.8, list = FALSE)
+
+kenya_train <- kenya_df[train_idx, ]
+kenya_test  <- kenya_df[-train_idx, ]
+
+cat("Train rows:", nrow(kenya_train), "\n")
+cat("Test rows :", nrow(kenya_test), "\n")
+```
+
+10. Kenyan Benchmark XGBoost Model
+```{r}
+benchmark_features <- c(
+  "ClaimAmount", "VehicleCategory", "AccidentArea", "Age",
+  "VehiclePrice", "Previous_Claims_Count", "Vehicle_Age",
+  "Monthly_Premium_KES", "Accident_Cause"
+)
+
+benchmark_features <- intersect(benchmark_features, names(kenya_train))
+
+x_train_bench <- kenya_train[, benchmark_features, drop = FALSE]
+x_test_bench  <- kenya_test[, benchmark_features, drop = FALSE]
+char_cols_bench <- names(x_train_bench)[sapply(x_train_bench, is.character)]
+if (length(char_cols_bench) > 0) {
+  x_train_bench[char_cols_bench] <- lapply(x_train_bench[char_cols_bench], as.factor)
+  x_test_bench[char_cols_bench]  <- Map(
+    function(x, lvl) factor(as.character(x), levels = lvl),
+    x_test_bench[char_cols_bench],
+    lapply(x_train_bench[char_cols_bench], levels)
+  )
+}
+
+# Remove single-level factors before model.matrix
+x_train_bench <- fix_single_level_factors(x_train_bench)
+
+# Keep only same columns in test set
+x_test_bench <- x_test_bench[, names(x_train_bench), drop = FALSE]
+
+# Re-apply factor levels from training set
+factor_cols_bench <- names(x_train_bench)[sapply(x_train_bench, is.factor)]
+for (nm in factor_cols_bench) {
+  x_test_bench[[nm]] <- factor(as.character(x_test_bench[[nm]]),
+                               levels = levels(x_train_bench[[nm]]))
+}
+
+train_matrix <- model.matrix(~ . - 1, data = x_train_bench)
+test_matrix  <- model.matrix(~ . - 1, data = x_test_bench)
+
+missing_in_test <- setdiff(colnames(train_matrix), colnames(test_matrix))
+for (nm in missing_in_test) {
+  test_matrix <- cbind(test_matrix, rep(0, nrow(test_matrix)))
+  colnames(test_matrix)[ncol(test_matrix)] <- nm
+}
+
+extra_in_test <- setdiff(colnames(test_matrix), colnames(train_matrix))
+if (length(extra_in_test) > 0) {
+  test_matrix <- test_matrix[, !colnames(test_matrix) %in% extra_in_test, drop = FALSE]
+}
+
+test_matrix <- test_matrix[, colnames(train_matrix), drop = FALSE]
+
+dtrain_bench <- xgb.DMatrix(data = train_matrix, label = kenya_train$FraudProxy)
+dtest_bench  <- xgb.DMatrix(data = test_matrix, label = kenya_test$FraudProxy)
+
+params_bench <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = 4,
+  eta = 0.1,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+kenya_benchmark_model <- xgb.train(
+  params = params_bench,
+  data = dtrain_bench,
+  nrounds = 100,
+  verbose = 0
+)
+
+kenya_benchmark_full_probs <- predict(kenya_benchmark_model, dtest_bench)
+y_kenya <- kenya_test$FraudProxy
+
+benchmark_results <- calc_metrics(y_true = y_kenya, probs = kenya_benchmark_full_probs, threshold = 0.5)
+benchmark_results
+```
+
+11. Load Kaggle Data to Recreate Training Preprocessors
+```{r}
+
+kaggle_df <- read.csv(kaggle_data_path, stringsAsFactors = FALSE)
+
+kaggle_df$FraudFound <- ifelse(kaggle_df$FraudFound == "Yes", 1, 0)
+
+if (!"ClaimID" %in% names(kaggle_df)) {
+  kaggle_df$ClaimID <- paste0("CLM_", seq_len(nrow(kaggle_df)))
+}
+```
+
+12. Standardize Kenyan Data to Kaggle-Like Schema
+```{r}
+kenya_std <- kenya_df
+
+required_defaults <- list(
+  Age = 0,
+  Sex = "Unknown",
+  AccidentArea = "Unknown",
+  VehicleCategory = "Unknown",
+  ClaimAmount = 0,
+  VehiclePrice = 0,
+  PastNumberOfClaims = 0,
+  AgeOfVehicle = 0,
+  PolicyTenure = 1,
+  DayOfWeek = "Unknown",
+  Month = "Unknown",
+  MonthClaimed = "Unknown",
+  WeekOfMonth = "Unknown",
+  WeekOfMonthClaimed = "Unknown",
+  Make = "Unknown",
+  MaritalStatus = "Unknown",
+  Fault = "Unknown",
+  PolicyType = "Unknown",
+  PoliceReportFiled = "Unknown",
+  WitnessPresent = "Unknown",
+  AgentType = "Unknown",
+  BasePolicy = "Unknown",
+  Deductible = 0,
+  DriverRating = 0,
+  NumberOfSuppliments = 0,
+  AddressChange.Claim = "Unknown",
+  NumberOfCars = 1,
+  Days.Policy.Accident = "Unknown",
+  Days.Policy.Claim = "Unknown",
+  RepNumber = "Unknown"
+)
+
+for (nm in names(required_defaults)) {
+  if (!nm %in% names(kenya_std)) {
+    kenya_std[[nm]] <- required_defaults[[nm]]
+  }
+}
+
+# Mappings from Kenyan fields
+if ("Gender" %in% names(kenya_std)) kenya_std$Sex <- safe_char(kenya_std$Gender)
+if ("Previous_Claims_Count" %in% names(kenya_std)) kenya_std$PastNumberOfClaims <- safe_num(kenya_std$Previous_Claims_Count)
+if ("Vehicle_Age" %in% names(kenya_std)) kenya_std$AgeOfVehicle <- safe_num(kenya_std$Vehicle_Age)
+if ("Policy_Term_Months" %in% names(kenya_std)) kenya_std$PolicyTenure <- pmax(safe_num(kenya_std$Policy_Term_Months) / 12, 1)
+if ("Use_Purpose" %in% names(kenya_std)) kenya_std$PolicyType <- safe_char(kenya_std$Use_Purpose)
+if ("Driver_Experience_Years" %in% names(kenya_std)) kenya_std$DriverRating <- safe_num(kenya_std$Driver_Experience_Years)
+if ("Policy_ID" %in% names(kenya_std)) kenya_std$RepNumber <- safe_char(kenya_std$Policy_ID)
+if ("Third_Party_Only" %in% names(kenya_std)) {
+  kenya_std$BasePolicy <- ifelse(safe_char(kenya_std$Third_Party_Only) %in% c("Yes", "TRUE", "1"),
+                                 "Liability", "Collision")
+}
+
+# Clean types
+char_cols_std <- names(kenya_std)[sapply(kenya_std, is.character)]
+num_cols_std  <- names(kenya_std)[sapply(kenya_std, function(x) is.numeric(x) || is.integer(x))]
+
+kenya_std[char_cols_std] <- lapply(kenya_std[char_cols_std], safe_char)
+kenya_std[num_cols_std]  <- lapply(kenya_std[num_cols_std], safe_num)
+```
+
+13. Real XGBoost Predictions on Kenyan Data
+```{r}
+xgb_preprocess <- function(data) {
+  out <- data %>%
+    mutate(
+      claim_to_value_ratio = ifelse(VehiclePrice == 0, 0, ClaimAmount / VehiclePrice),
+      claims_per_year      = ifelse(PolicyTenure == 0, 0, PastNumberOfClaims / PolicyTenure),
+      claim_month          = as.factor(Month),
+      claim_day            = as.factor(DayOfWeek),
+      high_risk_combo      = ifelse(PastNumberOfClaims > 2 & DriverRating < 3, 1, 0),
+      vehicle_age_cat      = case_when(
+        AgeOfVehicle <= 3 ~ "New",
+        AgeOfVehicle <= 7 ~ "Medium",
+        TRUE ~ "Old"
+      )
+    )
+
+  out
+}
+
+xgb_artifacts <- readRDS(xgb_artifacts_path)
+xgb_model <- xgb.load(xgb_model_path)
+
+kenya_xgb_df <- xgb_preprocess(kenya_std)
+
+drop_cols <- c("FraudFound", "FraudProxy", "FraudProxyScore", "PolicyNumber", "policy_id", "RowID")
+kenya_xgb_X <- kenya_xgb_df %>% select(-any_of(drop_cols))
+
+char_cols_xgb <- names(kenya_xgb_X)[sapply(kenya_xgb_X, is.character)]
+if (length(char_cols_xgb) > 0) {
+  kenya_xgb_X <- kenya_xgb_X %>% mutate(across(all_of(char_cols_xgb), as.factor))
+}
+
+# Remove single-level factors before dummy creation
+kenya_xgb_X <- fix_single_level_factors(kenya_xgb_X)
+
+factor_cols_xgb <- names(kenya_xgb_X)[sapply(kenya_xgb_X, is.factor)]
+if (length(factor_cols_xgb) > 0) {
+  kenya_xgb_X <- fastDummies::dummy_cols(
+    kenya_xgb_X,
+    select_columns = factor_cols_xgb,
+    remove_first_dummy = TRUE,
+    remove_selected_columns = TRUE
+  )
+}
+
+kenya_xgb_X <- kenya_xgb_X %>%
+  mutate(across(everything(), ~ safe_num(.)))
+
+trained_features <- xgb_artifacts$features
+
+for (nm in setdiff(trained_features, names(kenya_xgb_X))) {
+  kenya_xgb_X[[nm]] <- 0
+}
+
+kenya_xgb_X <- kenya_xgb_X[, trained_features, drop = FALSE]
+
+xgb_predictions <- predict(xgb_model, xgb.DMatrix(as.matrix(kenya_xgb_X)))
+summary(xgb_predictions)
+```
+
+14. Real LSTM Predictions on Kenyan Data
+```{r}
+# Ensuring Kaggle has all required columns for narrative generation
+for (nm in names(required_defaults)) {
+  if (!nm %in% names(kaggle_df)) {
+    kaggle_df[[nm]] <- required_defaults[[nm]]
+  }
+}
+
+kaggle_df$claim_narrative <- make_kaggle_style_narrative(kaggle_df)
+
+train_index_lstm <- createDataPartition(kaggle_df$FraudFound, p = 0.8, list = FALSE)
+train_df_lstm <- kaggle_df[train_index_lstm, ]
+
+max_words <- 10000
+max_len <- 80
+
+vectorizer <- layer_text_vectorization(
+  max_tokens = max_words,
+  output_mode = "int",
+  output_sequence_length = max_len
+)
+
+adapt(vectorizer, train_df_lstm$claim_narrative)
+
+kenya_std$claim_narrative <- make_kaggle_style_narrative(kenya_std)
+X_text_kenya <- as.array(vectorizer(kenya_std$claim_narrative))
+
+lstm_model <- load_model(lstm_model_path)
+lstm_predictions <- as.numeric(predict(lstm_model, X_text_kenya))
+
+summary(lstm_predictions)
+```
+
+15. Real GNN Predictions on Kenyan Data
+```{r}
+build_graph_objects <- function(df_input) {
+  df_local <- df_input
+
+  if (!"ClaimID" %in% names(df_local)) {
+    df_local$ClaimID <- paste0("CLM_", seq_len(nrow(df_local)))
+  }
+
+  df_local$PolicyHolderID <- paste0("PH_", if ("RepNumber" %in% names(df_local)) safe_char(df_local$RepNumber) else seq_len(nrow(df_local)))
+  df_local$AgentID <- paste0("AG_", if ("RepNumber" %in% names(df_local)) safe_char(df_local$RepNumber) else "UNK")
+  garage_key <- paste(df_local$AccidentArea, df_local$Make, df_local$VehicleCategory, sep = "_")
+  df_local$GarageID <- paste0("GAR_", as.integer(as.factor(garage_key)))
+
+  numeric_cols <- intersect(
+    c("Age", "ClaimAmount", "Deductible", "DriverRating", "NumberOfCars", "NumberOfSuppliments"),
+    names(df_local)
+  )
+
+  categorical_candidates <- intersect(
+    c("Sex", "MaritalStatus", "Fault", "PolicyType", "VehicleCategory",
+      "PoliceReportFiled", "WitnessPresent", "AgentType", "BasePolicy",
+      "AccidentArea", "VehiclePrice", "AgeOfVehicle", "Month",
+      "MonthClaimed", "WeekOfMonth", "WeekOfMonthClaimed",
+      "DayOfWeek", "Days.Policy.Accident", "Days.Policy.Claim",
+      "PastNumberOfClaims", "Make"),
+    names(df_local)
+  )
+
+ df_local[categorical_candidates] <- lapply(df_local[categorical_candidates], safe_char)
+df_local[categorical_candidates] <- lapply(df_local[categorical_candidates], as.factor)
+
+max_levels <- 20
+categorical_cols <- categorical_candidates[
+  sapply(df_local[categorical_candidates], function(x) {
+    x <- droplevels(as.factor(x))
+    nlevels(x) >= 2 && nlevels(x) <= max_levels
+  })
+]
+
+X_num <- as.matrix(df_local[, numeric_cols, drop = FALSE])
+
+if (length(categorical_cols) > 0) {
+  cat_df <- df_local[, categorical_cols, drop = FALSE]
+  cat_df <- fix_single_level_factors(cat_df)
+
+  if (ncol(cat_df) > 0) {
+    dummies <- caret::dummyVars(~ ., data = cat_df)
+    X_cat <- predict(dummies, newdata = cat_df)
+    X_cat <- as.matrix(X_cat)
+  } else {
+    X_cat <- matrix(0, nrow = nrow(df_local), ncol = 0)
+  }
+} else {
+  X_cat <- matrix(0, nrow = nrow(df_local), ncol = 0)
+}
+
+  claim_features <- cbind(X_num, X_cat)
+  claim_features[is.na(claim_features)] <- 0
+  claim_features <- scale(claim_features)
+
+  edges_claim_ph <- data.frame(from = df_local$ClaimID, to = df_local$PolicyHolderID)
+  edges_claim_agent <- data.frame(from = df_local$ClaimID, to = df_local$AgentID)
+  edges_claim_garage <- data.frame(from = df_local$ClaimID, to = df_local$GarageID)
+
+  make_shared_edges <- function(data, col_name, max_group_size = 5) {
+    if (!(col_name %in% names(data))) {
+      return(data.frame(from = character(), to = character()))
+    }
+    groups <- split(data$ClaimID, data[[col_name]])
+    groups <- groups[sapply(groups, length) > 1]
+
+    out <- list()
+    k <- 1
+    for (ids in groups) {
+      if (length(ids) > max_group_size) ids <- sample(ids, max_group_size)
+      if (length(ids) < 2) next
+      pairs <- combn(ids, 2)
+      out[[k]] <- data.frame(from = pairs[1,], to = pairs[2,])
+      k <- k + 1
+    }
+    if (length(out) == 0) return(data.frame(from = character(), to = character()))
+    bind_rows(out)
+  }
+
+  edges_shared_rep <- make_shared_edges(df_local, "RepNumber", 5)
+  edges_shared_area <- make_shared_edges(df_local, "AccidentArea", 5)
+
+  edges <- bind_rows(
+    edges_claim_ph, edges_claim_agent, edges_claim_garage,
+    edges_shared_rep, edges_shared_area
+  ) %>% distinct()
+
+  claim_nodes <- data.frame(node_id = df_local$ClaimID, node_type = "claim")
+  ph_nodes <- data.frame(node_id = unique(df_local$PolicyHolderID), node_type = "policyholder")
+  agent_nodes <- data.frame(node_id = unique(df_local$AgentID), node_type = "agent")
+  garage_nodes <- data.frame(node_id = unique(df_local$GarageID), node_type = "garage")
+
+  nodes <- bind_rows(claim_nodes, ph_nodes, agent_nodes, garage_nodes) %>%
+    distinct() %>%
+    mutate(node_index = row_number() - 1)
+
+  num_nodes <- nrow(nodes)
+  num_features <- ncol(claim_features)
+
+  X_all <- matrix(0, nrow = num_nodes, ncol = num_features)
+  claim_idx <- match(df_local$ClaimID, nodes$node_id)
+  X_all[claim_idx, ] <- claim_features
+
+  edge_df <- edges %>%
+    mutate(
+      from_idx = match(from, nodes$node_id) - 1,
+      to_idx   = match(to, nodes$node_id) - 1
+    ) %>%
+    filter(!is.na(from_idx), !is.na(to_idx)) %>%
+    select(from_idx, to_idx)
+
+  list(
+    df = df_local,
+    nodes = nodes,
+    X_all = X_all,
+    edge_index_df = as.matrix(edge_df),
+    claim_idx = claim_idx
+  )
+}
+
+train_final_gnn_and_predict <- function(kaggle_graph, kenya_graph, y_train_claims) {
+  main <- reticulate::import_main(convert = FALSE)
+
+  p_train <- ncol(kaggle_graph$X_all)
+  p_test <- ncol(kenya_graph$X_all)
+
+  if (p_test < p_train) {
+    kenya_graph$X_all <- cbind(
+      kenya_graph$X_all,
+      matrix(0, nrow = nrow(kenya_graph$X_all), ncol = p_train - p_test)
+    )
+  } else if (p_test > p_train) {
+    kenya_graph$X_all <- kenya_graph$X_all[, seq_len(p_train), drop = FALSE]
+  }
+
+  y_all <- rep(0L, nrow(kaggle_graph$nodes))
+  y_all[kaggle_graph$claim_idx] <- as.integer(y_train_claims)
+
+  train_mask <- rep(FALSE, nrow(kaggle_graph$nodes))
+  train_mask[kaggle_graph$claim_idx] <- TRUE
+
+  claim_mask_kenya <- rep(FALSE, nrow(kenya_graph$nodes))
+  claim_mask_kenya[kenya_graph$claim_idx] <- TRUE
+
+  main$X_train_all <- reticulate::r_to_py(as.matrix(kaggle_graph$X_all))
+  main$y_train_all <- reticulate::r_to_py(as.integer(y_all))
+  main$train_mask  <- reticulate::r_to_py(as.integer(train_mask))
+  main$edge_train  <- reticulate::r_to_py(as.matrix(kaggle_graph$edge_index_df))
+
+  main$X_kenya_all <- reticulate::r_to_py(as.matrix(kenya_graph$X_all))
+  main$claim_mask_kenya <- reticulate::r_to_py(as.integer(claim_mask_kenya))
+  main$edge_kenya <- reticulate::r_to_py(as.matrix(kenya_graph$edge_index_df))
+
+  reticulate::py_run_string("
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def build_adj(edge_index_np, num_nodes):
+    row = edge_index_np[:,0]
+    col = edge_index_np[:,1]
+
+    self_loops = np.arange(num_nodes)
+    row = np.concatenate([row, self_loops])
+    col = np.concatenate([col, self_loops])
+
+    indices = torch.tensor(np.vstack([row, col]), dtype=torch.long)
+    values = torch.ones(indices.shape[1], dtype=torch.float32)
+
+    A = torch.sparse_coo_tensor(indices, values, (num_nodes, num_nodes)).coalesce()
+
+    deg = torch.zeros(num_nodes, dtype=torch.float32)
+    deg.index_add_(0, A.indices()[0], A.values())
+    deg = torch.clamp(deg, min=1.0)
+    deg_inv_sqrt = torch.pow(deg, -0.5)
+
+    r = A.indices()[0]
+    c = A.indices()[1]
+    norm_values = deg_inv_sqrt[r] * A.values() * deg_inv_sqrt[c]
+    norm_values = torch.nan_to_num(norm_values, nan=0.0, posinf=0.0, neginf=0.0)
+
+    A_hat = torch.sparse_coo_tensor(A.indices(), norm_values, (num_nodes, num_nodes)).coalesce()
+    return A_hat
+
+class GCNLayer(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features)
+
+    def forward(self, X, A_hat):
+        X = self.linear(X)
+        return torch.sparse.mm(A_hat, X)
+
+class GCN(nn.Module):
+    def __init__(self, in_features, hidden_dim, out_features):
+        super().__init__()
+        self.gcn1 = GCNLayer(in_features, hidden_dim)
+        self.gcn2 = GCNLayer(hidden_dim, out_features)
+        self.dropout = nn.Dropout(0.2)
+
+    def forward(self, X, A_hat):
+        x = self.gcn1(X, A_hat)
+        x = F.relu(x)
+        x = self.dropout(x)
+        x = self.gcn2(x, A_hat)
+        return x
+
+X_np = np.array(X_train_all, dtype=np.float32)
+y_np = np.array(y_train_all, dtype=np.int64)
+train_mask_np = np.array(train_mask, dtype=bool)
+edge_train_np = np.array(edge_train, dtype=np.int64)
+
+X = torch.tensor(np.nan_to_num(X_np), dtype=torch.float32)
+y = torch.tensor(y_np, dtype=torch.long)
+train_mask_t = torch.tensor(train_mask_np, dtype=torch.bool)
+
+A_hat = build_adj(edge_train_np, X.shape[0])
+
+model = GCN(in_features=X.shape[1], hidden_dim=16, out_features=2)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-4)
+
+num_pos = int((y[train_mask_t] == 1).sum().item())
+num_neg = int((y[train_mask_t] == 0).sum().item())
+class_weights = torch.tensor([1.0, num_neg / max(num_pos, 1)], dtype=torch.float32)
+
+for epoch in range(1, 101):
+    model.train()
+    optimizer.zero_grad()
+    out = model(X, A_hat)
+    out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    loss = F.cross_entropy(out[train_mask_t], y[train_mask_t], weight=class_weights)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optimizer.step()
+
+Xk_np = np.array(X_kenya_all, dtype=np.float32)
+claim_mask_kenya_np = np.array(claim_mask_kenya, dtype=bool)
+edge_kenya_np = np.array(edge_kenya, dtype=np.int64)
+
+Xk = torch.tensor(np.nan_to_num(Xk_np), dtype=torch.float32)
+A_hat_k = build_adj(edge_kenya_np, Xk.shape[0])
+
+model.eval()
+with torch.no_grad():
+    logits_k = model(Xk, A_hat_k)
+    logits_k = torch.nan_to_num(logits_k, nan=0.0, posinf=0.0, neginf=0.0)
+    probs_k = F.softmax(logits_k, dim=1)[:, 1].cpu().numpy()
+
+probs_k = np.nan_to_num(probs_k, nan=0.5, posinf=0.5, neginf=0.5)
+gnn_claim_probs_kenya = probs_k[claim_mask_kenya_np]
+")
+
+  main2 <- reticulate::import_main(convert = TRUE)
+  as.numeric(main2$gnn_claim_probs_kenya)
+}
+
+# Ensure Kaggle and Kenya both have required fields
+for (nm in names(required_defaults)) {
+  if (!nm %in% names(kaggle_df)) kaggle_df[[nm]] <- required_defaults[[nm]]
+  if (!nm %in% names(kenya_std)) kenya_std[[nm]] <- required_defaults[[nm]]
+}
+
+kaggle_graph <- build_graph_objects(kaggle_df)
+kenya_graph  <- build_graph_objects(kenya_std)
+
+gnn_predictions <- train_final_gnn_and_predict(
+  kaggle_graph = kaggle_graph,
+  kenya_graph = kenya_graph,
+  y_train_claims = kaggle_df$FraudFound
+)
+
+summary(gnn_predictions)
+```
+
+16. Final Ensemble Inference Using Real Base Predictions
+```{r}
+stopifnot(length(xgb_predictions) == nrow(kenya_df))
+stopifnot(length(lstm_predictions) == nrow(kenya_df))
+stopifnot(length(gnn_predictions) == nrow(kenya_df))
+
+meta_glm <- readRDS(meta_glm_path)
+best_threshold <- readRDS(best_threshold_path)
+
+kenya_meta <- data.frame(
+  PXGB  = as.numeric(xgb_predictions),
+  PLSTM = as.numeric(lstm_predictions),
+  PGNN  = as.numeric(gnn_predictions)
+)
+
+kenya_meta$FinalProb <- predict(meta_glm, newdata = kenya_meta, type = "response")
+kenya_meta$FinalPred <- ifelse(kenya_meta$FinalProb >= best_threshold, 1, 0)
+
+# attach ensemble outputs back to the FULL Kenyan dataset first
+kenya_df$PXGB      <- kenya_meta$PXGB
+kenya_df$PLSTM     <- kenya_meta$PLSTM
+kenya_df$PGNN      <- kenya_meta$PGNN
+kenya_df$FinalProb <- kenya_meta$FinalProb
+kenya_df$FinalPred <- kenya_meta$FinalPred
+
+head(kenya_df[, c("ClaimID", "PXGB", "PLSTM", "PGNN", "FinalProb", "FinalPred")])
+```
+
+
+17. Restrict Ensemble Evaluation to the Same kenya_test Subset
+```{r}
+# use the SAME test indices created in Step 9
+kenya_test_eval <- kenya_df[-train_idx, , drop = FALSE]
+
+# sanity checks
+stopifnot(nrow(kenya_test_eval) == nrow(kenya_test))
+stopifnot(all(kenya_test_eval$ClaimID == kenya_test$ClaimID))
+
+# overwriting kenya_test with the enriched version
+kenya_test <- kenya_test_eval
+
+head(kenya_test[, c("ClaimID", "FraudProxy", "FinalProb", "FinalPred")])
+```
+
+18. Evaluate Full Ensemble Against Kenyan Proxy Label on kenya_test Only
+```{r}
+kenya_ensemble_results <- calc_metrics(
+  y_true = kenya_test$FraudProxy,
+  probs = kenya_test$FinalProb,
+  threshold = best_threshold
+)
+
+kenya_ensemble_results
+```
+
+19. Compare Kenyan Benchmark vs Full Ensemble on the Same Test Subset
+```{r}
+# attach benchmark predictions to the SAME kenya_test subset
+kenya_test$BenchmarkProb <- kenya_benchmark_full_probs
+kenya_test$BenchmarkPred <- ifelse(kenya_test$BenchmarkProb >= 0.5, 1, 0)
+
+model_comparison <- bind_rows(
+  benchmark_results %>% mutate(Model = "Kenyan XGBoost Benchmark", .before = 1),
+  kenya_ensemble_results %>% mutate(Model = "Full Ensemble (Same kenya_test subset)", .before = 1)
+)
+
+model_comparison
+```
+
+save the aligned evaluation dataset
+```{r}
+# 20. Save Final Aligned Outputs (Thesis-Ready)
+
+# ============================================================
+# Save the FINAL evaluation dataset (aligned kenya_test only)
+# ============================================================
+
+# This dataset now contains:
+# - True proxy labels
+# - Benchmark predictions
+# - Ensemble predictions
+# - All model probabilities
+
+saveRDS(kenya_test, "kenya_test_final_aligned_evaluation.rds")
+write.csv(kenya_test, "kenya_test_final_aligned_evaluation.csv", row.names = FALSE)
+
+# ============================================================
+# Save model comparison results
+# ============================================================
+
+saveRDS(model_comparison, "kenya_final_model_comparison.rds")
+write.csv(model_comparison, "kenya_final_model_comparison.csv", row.names = FALSE)
+
+# ============================================================
+# Optional: Save full dataset with predictions (for appendix use)
+# ============================================================
+
+saveRDS(kenya_df, "kenya_full_dataset_with_ensemble_outputs.rds")
+write.csv(kenya_df, "kenya_full_dataset_with_ensemble_outputs.csv", row.names = FALSE)
+
+# ============================================================
+# Console confirmation
+# ============================================================
+
+cat("\n====================================================\n")
+cat("✓ FINAL KENYAN VALIDATION OUTPUTS SAVED SUCCESSFULLY\n")
+cat("----------------------------------------------------\n")
+cat("Saved files:\n")
+cat("- kenya_test_final_aligned_evaluation.*  (MAIN RESULTS)\n")
+cat("- kenya_final_model_comparison.*        (CHAPTER 4 TABLE)\n")
+cat("- kenya_full_dataset_with_ensemble_outputs.* (APPENDIX)\n")
+cat("====================================================\n\n")
+
+```
+
+

@@ -1,0 +1,813 @@
+---
+title: "GNN_Updated"
+author: "John Munyaka"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+reticulate::py_config()
+reticulate::py_install("torch")
+```
+
+
+Step 0: Load packages and environment
+```{r}
+install.packages(c("pacman", "tidyverse", "caret", "pROC", "PRROC", "reticulate", "Matrix"))
+
+library(pacman)
+pacman::p_load(
+  tidyverse,
+  caret,
+  pROC,
+  PRROC,
+  reticulate,
+  Matrix
+)
+
+set.seed(42)
+```
+
+Fixing Saved paths
+```{r}
+project_dir <- "C:/Users/USER/Documents/project"
+pred_dir <- file.path(project_dir, "predictions")
+
+dir.create(pred_dir, showWarnings = FALSE, recursive = TRUE)
+
+cat("Predictions will be saved in:", pred_dir, "\n")
+```
+
+Step 1: Load data
+```{r}
+df <- read.csv("C:/Users/USER/Desktop/data_set_2_kaggle.csv", stringsAsFactors = FALSE)
+
+str(df)
+dim(df)
+
+# Clean column names once
+names(df) <- make.names(names(df))
+
+# Target
+df$FraudFound <- ifelse(df$FraudFound == "Yes", 1, 0)
+
+table(df$FraudFound)
+prop.table(table(df$FraudFound))
+```
+Step 2: Basic data cleaning
+```{r}
+# Convert selected columns to character where needed
+char_cols <- c(
+  "Month", "WeekOfMonth", "DayOfWeek", "Make", "AccidentArea",
+  "MonthClaimed", "WeekOfMonthClaimed", "Sex", "MaritalStatus",
+  "Fault", "PolicyType", "VehicleCategory", "VehiclePrice",
+  "Days.Policy.Accident", "Days.Policy.Claim", "PastNumberOfClaims",
+  "AgeOfVehicle", "AgeOfPolicyHolder", "PoliceReportFiled",
+  "WitnessPresent", "AgentType", "NumberOfSuppliments",
+  "AddressChange.Claim", "NumberOfCars", "BasePolicy"
+)
+
+char_cols <- intersect(char_cols, names(df))
+df[char_cols] <- lapply(df[char_cols], as.character)
+
+# Remove duplicated rows if any
+df <- df %>% distinct()
+
+# Check missing values
+colSums(is.na(df))
+```
+
+Step 3: Create defensible proxy entity IDs from observed data
+```{r}
+n <- nrow(df)
+
+# Unique claim ID
+df$ClaimID <- paste0("CLM_", seq_len(n))
+
+# Proxy policyholder ID
+if ("PolicyNumber" %in% names(df)) {
+  df$PolicyHolderID <- paste0("PH_", df$PolicyNumber)
+} else {
+  ph_key <- paste(
+    df$Age, df$Sex, df$MaritalStatus, df$AgeOfPolicyHolder,
+    sep = "_"
+  )
+  df$PolicyHolderID <- paste0("PH_", as.integer(as.factor(ph_key)))
+}
+
+# Proxy agent ID
+if ("RepNumber" %in% names(df)) {
+  df$AgentID <- paste0("AG_", df$RepNumber)
+} else {
+  df$AgentID <- paste0("AG_", as.integer(as.factor(df$AgentType)))
+}
+
+# Proxy garage ID from observed claim context
+garage_key <- paste(
+  df$AccidentArea, df$Make, df$VehicleCategory,
+  sep = "_"
+)
+df$GarageID <- paste0("GAR_", as.integer(as.factor(garage_key)))
+
+cat("Unique claims:", length(unique(df$ClaimID)), "\n")
+cat("Unique policyholder proxies:", length(unique(df$PolicyHolderID)), "\n")
+cat("Unique agent proxies:", length(unique(df$AgentID)), "\n")
+cat("Unique garage proxies:", length(unique(df$GarageID)), "\n")
+```
+
+```{r}
+if (file.exists(file.path(pred_dir, "gnn_train_claim_idx.rds"))) {
+  file.remove(file.path(pred_dir, "gnn_train_claim_idx.rds"))
+}
+if (file.exists(file.path(pred_dir, "gnn_test_claim_idx.rds"))) {
+  file.remove(file.path(pred_dir, "gnn_test_claim_idx.rds"))
+}
+```
+
+
+Step 4: Safe sampling with both classes preserved
+```{r}
+max_rows <- nrow(df)
+
+if (nrow(df) > max_rows) {
+  
+  fraud_df <- df %>% filter(FraudFound == 1)
+  nonfraud_df <- df %>% filter(FraudFound == 0)
+  
+  if (nrow(fraud_df) == 0 || nrow(nonfraud_df) == 0) {
+    stop("Step 4 error: one class is missing in the full dataset.")
+  }
+  
+  # Keep both classes represented
+  fraud_keep <- min(nrow(fraud_df), floor(max_rows * 0.5))
+  nonfraud_keep <- min(nrow(nonfraud_df), max_rows - fraud_keep)
+  
+  fraud_sample <- fraud_df %>% sample_n(fraud_keep)
+  nonfraud_sample <- nonfraud_df %>% sample_n(nonfraud_keep)
+  
+  df_gnn <- bind_rows(fraud_sample, nonfraud_sample) %>% arrange(ClaimID)
+  
+} else {
+  df_gnn <- df
+}
+
+dim(df_gnn)
+table(df_gnn$FraudFound)
+```
+Step 5: Prepare claim-node features
+```{r}
+# Numeric columns
+numeric_cols <- c(
+  "Age", "ClaimAmount", "Deductible", "DriverRating",
+  "NumberOfCars", "NumberOfSuppliments"
+)
+numeric_cols <- intersect(numeric_cols, names(df_gnn))
+
+# Candidate categorical columns
+categorical_candidates <- c(
+  "Sex", "MaritalStatus", "Fault", "PolicyType", "VehicleCategory",
+  "PoliceReportFiled", "WitnessPresent", "AgentType", "BasePolicy",
+  "AccidentArea", "VehiclePrice", "AgeOfVehicle", "AgeOfPolicyHolder",
+  "Month", "MonthClaimed", "WeekOfMonth", "WeekOfMonthClaimed",
+  "DayOfWeek", "Days.Policy.Accident", "Days.Policy.Claim",
+  "PastNumberOfClaims", "Make"
+)
+categorical_candidates <- intersect(categorical_candidates, names(df_gnn))
+
+# Keep only low-cardinality categorical columns
+max_levels <- 20
+
+categorical_cols <- categorical_candidates[
+  sapply(df_gnn[categorical_candidates], function(x) length(unique(x))) <= max_levels
+]
+
+cat("Categorical columns kept for one-hot encoding:\n")
+print(categorical_cols)
+
+cat("Dropped high-cardinality categorical columns:\n")
+print(setdiff(categorical_candidates, categorical_cols))
+
+# Numeric matrix
+X_num <- df_gnn[, numeric_cols, drop = FALSE] %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.matrix()
+
+# One-hot encode only compact categorical columns
+if (length(categorical_cols) > 0) {
+  dummies <- caret::dummyVars(~ ., data = df_gnn[, categorical_cols, drop = FALSE])
+  X_cat <- predict(dummies, newdata = df_gnn[, categorical_cols, drop = FALSE])
+  X_cat <- as.matrix(X_cat)
+} else {
+  X_cat <- matrix(0, nrow = nrow(df_gnn), ncol = 0)
+}
+
+# Combine
+claim_features <- cbind(X_num, X_cat)
+
+# Replace NA if any
+claim_features[is.na(claim_features)] <- 0
+
+# Scale
+claim_features <- scale(claim_features)
+
+cat("Final claim feature matrix dimensions:\n")
+print(dim(claim_features))
+```
+
+Step 6: Build meaningful graph edges
+```{r}
+# Claim -> entity edges
+edges_claim_ph <- data.frame(from = df_gnn$ClaimID, to = df_gnn$PolicyHolderID, stringsAsFactors = FALSE)
+edges_claim_agent <- data.frame(from = df_gnn$ClaimID, to = df_gnn$AgentID, stringsAsFactors = FALSE)
+edges_claim_garage <- data.frame(from = df_gnn$ClaimID, to = df_gnn$GarageID, stringsAsFactors = FALSE)
+
+make_shared_edges <- function(data, col_name, max_group_size = 5) {
+  if (!(col_name %in% names(data))) {
+    return(data.frame(from = character(), to = character(), stringsAsFactors = FALSE))
+  }
+  
+  groups <- split(data$ClaimID, data[[col_name]])
+  groups <- groups[sapply(groups, length) > 1]
+  
+  all_edges <- list()
+  idx <- 1
+  
+  for (ids in groups) {
+    if (length(ids) > max_group_size) ids <- sample(ids, max_group_size)
+    if (length(ids) < 2) next
+    
+    pairs <- combn(ids, 2)
+    all_edges[[idx]] <- data.frame(
+      from = pairs[1, ],
+      to   = pairs[2, ],
+      stringsAsFactors = FALSE
+    )
+    idx <- idx + 1
+  }
+  
+  if (length(all_edges) == 0) {
+    return(data.frame(from = character(), to = character(), stringsAsFactors = FALSE))
+  }
+  
+  bind_rows(all_edges)
+}
+
+# Keeping only a small number of shared-edge types
+edges_shared_rep <- make_shared_edges(df_gnn, "RepNumber", max_group_size = 5)
+edges_shared_area <- make_shared_edges(df_gnn, "AccidentArea", max_group_size = 5)
+
+edges <- bind_rows(
+  edges_claim_ph,
+  edges_claim_agent,
+  edges_claim_garage,
+  edges_shared_rep,
+  edges_shared_area
+) %>%
+  distinct()
+
+cat("Total edges:", nrow(edges), "\n")
+```
+
+Step 7: Build node table
+```{r}
+claim_nodes <- data.frame(node_id = df_gnn$ClaimID, node_type = "claim", stringsAsFactors = FALSE)
+ph_nodes <- data.frame(node_id = unique(df_gnn$PolicyHolderID), node_type = "policyholder", stringsAsFactors = FALSE)
+agent_nodes <- data.frame(node_id = unique(df_gnn$AgentID), node_type = "agent", stringsAsFactors = FALSE)
+garage_nodes <- data.frame(node_id = unique(df_gnn$GarageID), node_type = "garage", stringsAsFactors = FALSE)
+
+nodes <- bind_rows(claim_nodes, ph_nodes, agent_nodes, garage_nodes) %>%
+  distinct() %>%
+  mutate(node_index = row_number() - 1)
+
+dim(nodes)
+table(nodes$node_type)
+```
+
+Step 8: Build node feature matrix
+```{r}
+num_nodes <- nrow(nodes)
+num_features <- ncol(claim_features)
+
+X_all <- matrix(0, nrow = num_nodes, ncol = num_features)
+
+claim_idx <- match(df_gnn$ClaimID, nodes$node_id)
+X_all[claim_idx, ] <- claim_features
+
+dim(X_all)
+```
+
+Step 9: Build labels and masks
+```{r}
+df_gnn$FraudFound <- as.integer(df_gnn$FraudFound)
+df_gnn <- df_gnn %>% filter(!is.na(FraudFound))
+
+# Labels
+y_all <- rep(0, num_nodes)
+claim_idx <- match(df_gnn$ClaimID, nodes$node_id)
+y_all[claim_idx] <- df_gnn$FraudFound
+
+# Check class counts
+class_counts <- table(df_gnn$FraudFound)
+print(class_counts)
+
+if (!all(c(0, 1) %in% df_gnn$FraudFound)) {
+  stop("Step 9 error: df_gnn must contain both classes 0 and 1.")
+}
+
+set.seed(42)
+
+fraud_idx <- which(df_gnn$FraudFound == 1)
+nonfraud_idx <- which(df_gnn$FraudFound == 0)
+
+# Need at least 2 in each class to split into train/test
+if (length(fraud_idx) < 2 || length(nonfraud_idx) < 2) {
+  stop("Step 9 error: one class has fewer than 2 observations. Recheck Step 4.")
+}
+
+# Split each class separately so BOTH train and test contain both classes
+train_fraud_n <- max(1, floor(0.8 * length(fraud_idx)))
+train_nonfraud_n <- max(1, floor(0.8 * length(nonfraud_idx)))
+
+# Prevent taking all rows from a class into train
+train_fraud_n <- min(train_fraud_n, length(fraud_idx) - 1)
+train_nonfraud_n <- min(train_nonfraud_n, length(nonfraud_idx) - 1)
+
+train_fraud <- sample(fraud_idx, size = train_fraud_n)
+train_nonfraud <- sample(nonfraud_idx, size = train_nonfraud_n)
+
+train_claim_idx <- sort(c(train_fraud, train_nonfraud))
+test_claim_idx <- setdiff(seq_len(nrow(df_gnn)), train_claim_idx)
+
+# Final verification
+cat("Train class distribution:\n")
+print(table(df_gnn$FraudFound[train_claim_idx]))
+
+cat("Test class distribution:\n")
+print(table(df_gnn$FraudFound[test_claim_idx]))
+
+if (length(unique(df_gnn$FraudFound[test_claim_idx])) < 2) {
+  stop("Step 9 error: test set still has only one class.")
+}
+
+train_claims <- df_gnn$ClaimID[train_claim_idx]
+test_claims  <- df_gnn$ClaimID[test_claim_idx]
+
+train_mask <- nodes$node_id %in% train_claims
+test_mask  <- nodes$node_id %in% test_claims
+claim_mask <- nodes$node_type == "claim"
+
+saveRDS(train_claim_idx, file.path(pred_dir, "gnn_train_claim_idx.rds"))
+saveRDS(test_claim_idx, file.path(pred_dir, "gnn_test_claim_idx.rds"))
+
+cat("✓ Saved train/test claim indices\n")
+```
+
+Step 10: Convert edge list to index format
+```{r}
+edge_index_df <- edges %>%
+  left_join(nodes %>% select(node_id, from_index = node_index), by = c("from" = "node_id")) %>%
+  left_join(nodes %>% select(node_id, to_index = node_index), by = c("to" = "node_id")) %>%
+  filter(!is.na(from_index), !is.na(to_index)) %>%
+  select(from_index, to_index)
+
+# Make graph undirected
+edge_index_rev <- edge_index_df %>% rename(from_index = to_index, to_index = from_index)
+edge_index_df <- bind_rows(edge_index_df, edge_index_rev) %>% distinct()
+
+dim(edge_index_df)
+head(edge_index_df)
+```
+
+
+Step 11: Send data to Python with reticulate
+```{r}
+library(reticulate)
+
+use_python(Sys.which("python"), required = FALSE)
+
+# Initialize Python
+py_config()
+
+if (!py_available(initialize = TRUE)) {
+  stop("Python is not available.")
+}
+
+stopifnot(
+  exists("X_all"),
+  exists("y_all"),
+  exists("train_mask"),
+  exists("test_mask"),
+  exists("claim_mask"),
+  exists("edge_index_df")
+)
+
+# Import Python __main__ namespace
+main <- import_main(convert = FALSE)
+
+# Send objects to Python
+main$X_all <- r_to_py(as.matrix(X_all))
+main$y_all <- r_to_py(as.integer(y_all))
+main$train_mask <- r_to_py(as.integer(train_mask))
+main$test_mask <- r_to_py(as.integer(test_mask))
+main$claim_mask <- r_to_py(as.integer(claim_mask))
+main$edge_index <- r_to_py(as.matrix(edge_index_df))
+
+cat("Step 11 completed successfully.\n")
+```
+
+Step 12: Python GCN model
+```{r}
+py_run_string("
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# -----------------------------
+# Load data from R
+# -----------------------------
+X_np = np.array(X_all, dtype=np.float32)
+y_np = np.array(y_all, dtype=np.int64)
+
+train_mask_np = np.array(train_mask, dtype=bool)
+test_mask_np = np.array(test_mask, dtype=bool)
+claim_mask_np = np.array(claim_mask, dtype=bool)
+
+edge_index_np = np.array(edge_index, dtype=np.int64)
+
+# Defensive checks
+X_np = np.nan_to_num(X_np, nan=0.0, posinf=0.0, neginf=0.0)
+
+X = torch.tensor(X_np, dtype=torch.float32)
+y = torch.tensor(y_np, dtype=torch.long)
+
+train_mask = torch.tensor(train_mask_np, dtype=torch.bool)
+test_mask = torch.tensor(test_mask_np, dtype=torch.bool)
+claim_mask = torch.tensor(claim_mask_np, dtype=torch.bool)
+
+num_nodes = X.shape[0]
+
+# -----------------------------
+# Build sparse adjacency
+# -----------------------------
+row = edge_index_np[:, 0]
+col = edge_index_np[:, 1]
+
+# Add self-loops
+self_loops = np.arange(num_nodes)
+row = np.concatenate([row, self_loops])
+col = np.concatenate([col, self_loops])
+
+indices = torch.tensor(np.vstack([row, col]), dtype=torch.long)
+values = torch.ones(indices.shape[1], dtype=torch.float32)
+
+A = torch.sparse_coo_tensor(indices, values, (num_nodes, num_nodes)).coalesce()
+
+# -----------------------------
+# Sparse normalization
+# -----------------------------
+deg = torch.zeros(num_nodes, dtype=torch.float32)
+deg.index_add_(0, A.indices()[0], A.values())
+
+deg = torch.clamp(deg, min=1.0)
+deg_inv_sqrt = torch.pow(deg, -0.5)
+
+r = A.indices()[0]
+c = A.indices()[1]
+norm_values = deg_inv_sqrt[r] * A.values() * deg_inv_sqrt[c]
+
+# Remove any bad values
+norm_values = torch.nan_to_num(norm_values, nan=0.0, posinf=0.0, neginf=0.0)
+
+A_hat = torch.sparse_coo_tensor(A.indices(), norm_values, (num_nodes, num_nodes)).coalesce()
+
+# -----------------------------
+# Sparse GCN
+# -----------------------------
+class GCNLayer(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features)
+
+    def forward(self, X, A_hat):
+        X = self.linear(X)
+        return torch.sparse.mm(A_hat, X)
+
+class GCN(nn.Module):
+    def __init__(self, in_features, hidden_dim, out_features):
+        super().__init__()
+        self.gcn1 = GCNLayer(in_features, hidden_dim)
+        self.gcn2 = GCNLayer(hidden_dim, out_features)
+        self.dropout = nn.Dropout(0.2)
+
+    def forward(self, X, A_hat):
+        x = self.gcn1(X, A_hat)
+        x = F.relu(x)
+        x = self.dropout(x)
+        x = self.gcn2(x, A_hat)
+        return x
+
+model = GCN(in_features=X.shape[1], hidden_dim=16, out_features=2)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-4)
+
+num_pos = (y[train_mask] == 1).sum().item()
+num_neg = (y[train_mask] == 0).sum().item()
+class_weights = torch.tensor([1.0, num_neg / max(num_pos, 1)], dtype=torch.float32)
+
+# -----------------------------
+# Train
+# -----------------------------
+for epoch in range(1, 101):
+    model.train()
+    optimizer.zero_grad()
+    out = model(X, A_hat)
+
+    # Defensive cleanup
+    out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
+    loss = F.cross_entropy(out[train_mask], y[train_mask], weight=class_weights)
+    loss.backward()
+
+    # Gradient clipping
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+    optimizer.step()
+
+# -----------------------------
+# Final outputs
+# -----------------------------
+model.eval()
+with torch.no_grad():
+    logits = model(X, A_hat)
+    logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
+
+    probs = F.softmax(logits, dim=1)[:, 1].cpu().numpy()
+    preds = torch.argmax(logits, dim=1).cpu().numpy()
+
+# Final defensive cleanup
+probs = np.nan_to_num(probs, nan=0.5, posinf=0.5, neginf=0.5)
+
+claim_probs = probs[claim_mask_np]
+claim_preds = preds[claim_mask_np]
+claim_labels = y_np[claim_mask_np]
+")
+```
+
+Step 13: Pull predictions back into R
+```{r}
+main <- reticulate::import_main(convert = TRUE)
+
+claim_probs <- main$claim_probs
+claim_preds <- main$claim_preds
+claim_labels <- main$claim_labels
+
+stopifnot(length(claim_probs) == nrow(df_gnn))
+stopifnot(length(claim_labels) == nrow(df_gnn))
+
+cat("Invalid probabilities:\n")
+print(table(is.finite(claim_probs), useNA = "ifany"))
+summary(claim_probs)
+```
+
+
+
+Step 14: Evaluate GNN properly
+```{r}
+test_probs_eval <- as.numeric(claim_probs[test_claim_idx])
+test_labels_eval <- as.integer(df_gnn$FraudFound[test_claim_idx])
+test_preds_eval <- ifelse(test_probs_eval >= 0.5, 1, 0)
+
+cat("Test label distribution:\n")
+print(table(test_labels_eval))
+
+cat("Finite probs in test set:\n")
+print(table(is.finite(test_probs_eval), useNA = "ifany"))
+
+conf_mat <- caret::confusionMatrix(
+  factor(test_preds_eval, levels = c(0, 1)),
+  factor(test_labels_eval, levels = c(0, 1)),
+  positive = "1"
+)
+
+print(conf_mat)
+
+precision <- conf_mat$byClass["Pos Pred Value"]
+recall <- conf_mat$byClass["Sensitivity"]
+f1_score <- ifelse((precision + recall) == 0, 0, 2 * precision * recall / (precision + recall))
+
+cat("Precision:", round(precision, 4), "\n")
+cat("Recall:", round(recall, 4), "\n")
+cat("F1 Score:", round(f1_score, 4), "\n")
+
+if (all(c(0, 1) %in% unique(test_labels_eval))) {
+  roc_obj <- pROC::roc(test_labels_eval, test_probs_eval, quiet = TRUE)
+  roc_auc <- as.numeric(pROC::auc(roc_obj))
+
+  pr_obj <- PRROC::pr.curve(
+    scores.class0 = test_probs_eval[test_labels_eval == 1],
+    scores.class1 = test_probs_eval[test_labels_eval == 0],
+    curve = TRUE
+  )
+
+  cat("ROC-AUC:", round(roc_auc, 4), "\n")
+  cat("PR-AUC:", round(pr_obj$auc.integral, 4), "\n")
+}
+```
+Step 15: Save model outputs for ensemble
+```{r}
+gnn_claim_results <- data.frame(
+  ClaimID = df_gnn$ClaimID,
+  FraudFound = df_gnn$FraudFound,
+  gnn_prob = claim_probs
+)
+
+# Save evaluated test-set outputs from Step 14
+saveRDS(test_probs_eval, file.path(pred_dir, "gnn_test_predictions.rds"))
+saveRDS(test_labels_eval, file.path(pred_dir, "gnn_y_test.rds"))
+
+# Save full claim-level probabilities
+saveRDS(gnn_claim_results, file.path(pred_dir, "gnn_claim_results.rds"))
+
+cat("✓ Saved GNN test predictions/results\n")
+cat("Test predictions path: ", file.path(pred_dir, "gnn_test_predictions.rds"), "\n")
+cat("Test labels path: ", file.path(pred_dir, "gnn_y_test.rds"), "\n")
+cat("Claim results path: ", file.path(pred_dir, "gnn_claim_results.rds"), "\n")
+
+```
+
+
+Step 16: Generate OOF predictions for stacking
+```{r}
+generate_gnn_oof <- function(df_input, n_folds = 5) {
+  
+  library(reticulate)
+  
+  # Ensure Python is initialized
+  use_python(Sys.which("python"), required = FALSE)
+  py_config()
+  
+  if (!py_available(initialize = TRUE)) {
+    stop("Python is not available for Step 16.")
+  }
+  
+  # Use Python main namespace
+  main <- import_main(convert = FALSE)
+  
+  folds <- createFolds(df_input$FraudFound, k = n_folds, list = TRUE)
+  oof_pred <- numeric(nrow(df_input))
+  
+  for (i in seq_along(folds)) {
+    cat("Fold:", i, "\n")
+    
+    val_idx <- folds[[i]]
+    tr_idx <- setdiff(seq_len(nrow(df_input)), val_idx)
+    
+    train_claims_fold <- df_input$ClaimID[tr_idx]
+    val_claims_fold <- df_input$ClaimID[val_idx]
+    
+    train_mask_fold <- nodes$node_id %in% train_claims_fold
+    val_mask_fold <- nodes$node_id %in% val_claims_fold
+    
+    # Send data to Python safely
+    main$X_all <- r_to_py(as.matrix(X_all))
+    main$y_all <- r_to_py(as.integer(y_all))
+    main$train_mask <- r_to_py(as.integer(train_mask_fold))
+    main$test_mask <- r_to_py(as.integer(val_mask_fold))
+    main$claim_mask <- r_to_py(as.integer(claim_mask))
+    main$edge_index <- r_to_py(as.matrix(edge_index_df))
+    
+    py_run_string("
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# -----------------------------
+# Load fold data
+# -----------------------------
+X_np = np.array(X_all, dtype=np.float32)
+y_np = np.array(y_all, dtype=np.int64)
+
+train_mask_np = np.array(train_mask, dtype=bool)
+test_mask_np = np.array(test_mask, dtype=bool)
+claim_mask_np = np.array(claim_mask, dtype=bool)
+
+edge_index_np = np.array(edge_index, dtype=np.int64)
+
+X_np = np.nan_to_num(X_np, nan=0.0, posinf=0.0, neginf=0.0)
+
+X = torch.tensor(X_np, dtype=torch.float32)
+y = torch.tensor(y_np, dtype=torch.long)
+
+train_mask = torch.tensor(train_mask_np, dtype=torch.bool)
+test_mask = torch.tensor(test_mask_np, dtype=torch.bool)
+claim_mask = torch.tensor(claim_mask_np, dtype=torch.bool)
+
+num_nodes = X.shape[0]
+
+# -----------------------------
+# Sparse adjacency
+# -----------------------------
+row = edge_index_np[:, 0]
+col = edge_index_np[:, 1]
+
+self_loops = np.arange(num_nodes)
+row = np.concatenate([row, self_loops])
+col = np.concatenate([col, self_loops])
+
+indices = torch.tensor(np.vstack([row, col]), dtype=torch.long)
+values = torch.ones(indices.shape[1], dtype=torch.float32)
+
+A = torch.sparse_coo_tensor(indices, values, (num_nodes, num_nodes)).coalesce()
+
+deg = torch.zeros(num_nodes, dtype=torch.float32)
+deg.index_add_(0, A.indices()[0], A.values())
+
+deg = torch.clamp(deg, min=1.0)
+deg_inv_sqrt = torch.pow(deg, -0.5)
+
+r = A.indices()[0]
+c = A.indices()[1]
+norm_values = deg_inv_sqrt[r] * A.values() * deg_inv_sqrt[c]
+norm_values = torch.nan_to_num(norm_values, nan=0.0, posinf=0.0, neginf=0.0)
+
+A_hat = torch.sparse_coo_tensor(A.indices(), norm_values, (num_nodes, num_nodes)).coalesce()
+
+# -----------------------------
+# GCN
+# -----------------------------
+class GCNLayer(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features)
+
+    def forward(self, X, A_hat):
+        X = self.linear(X)
+        return torch.sparse.mm(A_hat, X)
+
+class GCN(nn.Module):
+    def __init__(self, in_features, hidden_dim, out_features):
+        super().__init__()
+        self.gcn1 = GCNLayer(in_features, hidden_dim)
+        self.gcn2 = GCNLayer(hidden_dim, out_features)
+        self.dropout = nn.Dropout(0.2)
+
+    def forward(self, X, A_hat):
+        x = self.gcn1(X, A_hat)
+        x = F.relu(x)
+        x = self.dropout(x)
+        x = self.gcn2(x, A_hat)
+        return x
+
+model = GCN(in_features=X.shape[1], hidden_dim=16, out_features=2)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-4)
+
+num_pos = (y[train_mask] == 1).sum().item()
+num_neg = (y[train_mask] == 0).sum().item()
+class_weights = torch.tensor([1.0, num_neg / max(num_pos, 1)], dtype=torch.float32)
+
+for epoch in range(1, 81):
+    model.train()
+    optimizer.zero_grad()
+    out = model(X, A_hat)
+    out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
+    loss = F.cross_entropy(out[train_mask], y[train_mask], weight=class_weights)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optimizer.step()
+
+model.eval()
+with torch.no_grad():
+    logits = model(X, A_hat)
+    logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
+    probs = F.softmax(logits, dim=1)[:, 1].cpu().numpy()
+
+probs = np.nan_to_num(probs, nan=0.5, posinf=0.5, neginf=0.5)
+
+claim_probs_fold = probs[claim_mask_np]
+")
+    
+    # Pull back fold claim probabilities
+    main2 <- import_main(convert = TRUE)
+    claim_probs_fold <- main2$claim_probs_fold
+    
+    # Store only validation predictions
+    oof_pred[val_idx] <- as.numeric(claim_probs_fold[val_idx])
+  }
+  
+  return(oof_pred)
+}
+
+gnn_oof_predictions <- generate_gnn_oof(df_gnn, n_folds = 5)
+
+summary(gnn_oof_predictions)
+sum(is.na(gnn_oof_predictions))
+
+saveRDS(gnn_oof_predictions, file.path(pred_dir, "gnn_oof_predictions.rds"))
+
+cat("✓ Saved GNN OOF predictions at:\n")
+cat(file.path(pred_dir, "gnn_oof_predictions.rds"), "\n")
+cat("Length:", length(gnn_oof_predictions), "\n")
+```
+

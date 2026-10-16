@@ -1,0 +1,575 @@
+---
+title: "XGboost"
+author: "John Munyaka"
+date: "`r Sys.Date()`"
+output:
+  word_document: default
+  html_document: default
+---
+
+
+
+Step 2:Load and Explore the Kaggle Dataset
+```{r}
+# Load libraries
+library(tidyverse)
+library(caret)
+library(xgboost)
+library(ROCR)
+library(ggplot2)
+library(corrplot)
+library(dplyr)
+# Read the dataset
+df <- read.csv("C:\\Users\\USER\\Desktop\\data_set_2_kaggle.csv")
+
+# Initial exploration
+str(df)
+summary(df)
+head(df)
+
+# Check the target variable distribution
+table(df$FraudFound)
+prop.table(table(df$FraudFound))
+
+# Check for missing values
+colSums(is.na(df))
+```
+
+Step 3:Data Preprocessing
+```{r}
+# Create a preprocessing function
+preprocess_data <- function(data) {
+  
+  # 1. Handle target variable
+  df_clean <- data %>%
+    mutate(FraudFound = ifelse(FraudFound == "Yes", 1, 0))
+  
+  # 2. Remove identifier columns that don't add predictive value
+  df_clean <- df_clean %>%
+    select(-PolicyNumber)  # Remove policy number if it exists
+  
+  # 3. Handle missing values
+  # For numeric columns: impute with median
+  numeric_cols <- df_clean %>% select_if(is.numeric) %>% names()
+  for(col in numeric_cols) {
+    df_clean[[col]][is.na(df_clean[[col]])] <- median(df_clean[[col]], na.rm = TRUE)
+  }
+  
+  # For categorical columns: impute with mode or create "Unknown" category
+  categorical_cols <- df_clean %>% select_if(is.character) %>% names()
+  for(col in categorical_cols) {
+    if(any(is.na(df_clean[[col]]))) {
+      df_clean[[col]][is.na(df_clean[[col]])] <- "Unknown"
+    }
+  }
+  
+  return(df_clean)
+}
+
+# Apply preprocessing
+df_clean <- preprocess_data(data=df)
+df_clean
+```
+
+Step 4:Feature Engineering
+```{r}
+feature_engineering <- function(data) {
+  
+  data <- data %>%
+    mutate(
+      # Monetary anomaly: Claim amount relative to vehicle value
+      claim_to_value_ratio = ClaimAmount / VehiclePrice,
+      
+      # Behavioral velocity: Claims per year (if you have policy tenure)
+       claims_per_year = PastNumberOfClaims / PolicyTenure,
+      
+      # Temporal features
+       claim_month = as.factor(Month),
+       claim_day = as.factor(DayOfWeek),
+      
+      # Risk score combination
+      high_risk_combo = ifelse(PastNumberOfClaims > 2 & 
+                                 DriverRating < 3, 1, 0),
+      
+      # Vehicle age category
+      vehicle_age_cat = case_when(
+        AgeOfVehicle <= 3 ~ "New",
+        AgeOfVehicle <= 7 ~ "Medium",
+        TRUE ~ "Old"
+      )
+    )
+  
+  return(data)
+}
+
+df_engineered <- feature_engineering(df_clean)
+df_engineered
+```
+
+Step 5:Encode Categorical Variables
+```{r}
+# Load required library for creating dummy variables
+library(fastDummies)
+# Make sure we have the data
+df_engineered <- feature_engineering(df_clean)
+
+# IDENTIFYING ALL COLUMN TYPES FIRST
+str(df_engineered)
+
+# SEPARATING TARGET FROM FEATURES
+# Ensuring FraudFound is numeric (0/1)
+df_model <- df_engineered %>%
+  mutate(FraudFound = ifelse(FraudFound == "Yes" | FraudFound == 1, 1, 0))
+
+# Store target separately
+y <- df_model$FraudFound
+
+# Remove target and any ID columns from features
+X <- df_model %>%
+  select(-FraudFound, -any_of(c("PolicyNumber", "policy_id", "RowID")))
+
+# 1. Identify column types
+numeric_cols <- X %>% select_if(is.numeric) %>% names()
+character_cols <- X %>% select_if(is.character) %>% names()
+factor_cols <- X %>% select_if(is.factor) %>% names()
+
+cat("Numeric columns:", length(numeric_cols), "\n")
+cat("Character columns:", length(character_cols), "\n")
+cat("Factor columns:", length(factor_cols), "\n")
+
+# 2. Convert character columns to factors first
+X_processed <- X
+if(length(character_cols) > 0) {
+  X_processed <- X_processed %>%
+    mutate(across(all_of(character_cols), as.factor))
+}
+
+# 3. NOW create dummy variables for ALL categorical columns (factors)
+if(length(factor_cols) > 0 || length(character_cols) > 0) {
+  # Get all factor columns after conversion
+  all_factor_cols <- X_processed %>% select_if(is.factor) %>% names()
+  
+  # Create dummy variables
+  X_encoded <- dummy_cols(
+    X_processed,
+    select_columns = all_factor_cols,
+    remove_first_dummy = TRUE,  # Avoids multicollinearity
+    remove_selected_columns = TRUE  # Removes original categorical columns
+  )
+} else {
+  X_encoded <- X_processed
+}
+
+# 4. To ensure ALL columns are numeric
+X_numeric <- X_encoded %>%
+  mutate(across(everything(), as.numeric))
+
+# 5. To check for any remaining non-numeric or infinite values
+str(X_numeric)
+summary(X_numeric)
+
+# 6. To handle any NA/NaN/Inf values
+X_numeric <- X_numeric %>%
+  mutate(across(everything(), ~ifelse(is.na(.) | is.nan(.) | is.infinite(.), 0, .)))
+
+# 7. Convert to matrix
+X_matrix <- as.matrix(X_numeric)
+
+# Verifying there are no issues
+cat("Matrix dimensions:", dim(X_matrix), "\n")
+cat("Matrix class:", class(X_matrix), "\n")
+cat("First few values:\n")
+print(X_matrix[1:3, 1:5])
+```
+
+Step 6: Handle Class Imbalance with SMOTE
+```{r}
+library(smotefamily)
+
+# SMOTE requires data frame, not matrix
+X_df <- as.data.frame(X_matrix)
+
+# Applying SMOTE
+set.seed(123)
+smote_result <- SMOTE(X = X_df, 
+                      target = as.numeric(y), 
+                      K = 5)
+
+# Extracting balanced data
+X_balanced <- smote_result$data[, -ncol(smote_result$data)]
+y_balanced <- smote_result$data$class
+
+# Converting back to matrix (ensuring numeric)
+X_balanced_matrix <- as.matrix(X_balanced)
+storage.mode(X_balanced_matrix) <- "numeric"  # Force numeric storage
+
+# Verifying there is no error
+cat("Balanced data dimensions:", dim(X_balanced_matrix), "\n")
+cat("Class distribution:\n")
+table(y_balanced)
+```
+
+
+
+Step 7: Split Data into Training and Testing Sets
+```{r}
+# Splitting the balanced data
+set.seed(42)
+train_index <- createDataPartition(y_balanced, p = 0.8, list = FALSE)
+
+X_train <- X_balanced_matrix[train_index, , drop = FALSE]
+X_test  <- X_balanced_matrix[-train_index, , drop = FALSE]
+
+y_train <- y_balanced[train_index]
+y_test  <- y_balanced[-train_index]
+
+# CHANGING EVERYTHING TO NUMERIC
+X_train <- apply(X_train, 2, as.numeric)
+X_test  <- apply(X_test, 2, as.numeric)
+
+y_train <- as.numeric(y_train)
+y_test  <- as.numeric(y_test)
+
+# Replacing problematic values
+X_train[is.na(X_train)] <- 0
+X_test[is.na(X_test)] <- 0
+
+X_train[is.infinite(X_train)] <- 0
+X_test[is.infinite(X_test)] <- 0
+
+# Convert to matrix explicitly
+X_train <- as.matrix(X_train)
+X_test  <- as.matrix(X_test)
+
+# Verifying types
+print(class(X_train))
+print(class(X_test))
+print(typeof(X_train))
+
+# Creating DMatrix
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dtest  <- xgb.DMatrix(data = X_test, label = y_test)
+
+cat("DMatrix successfully created!\n")
+```
+Step 8: Set XGBoost Parameters
+```{r}
+# Set parameters for binary classification
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = c("auc","logloss"),
+  max_depth = 6,
+  eta = 0.1,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  gamma = 0,
+  scale_pos_weight = 1
+)
+```
+
+Step 9: Train the XGBoost Model with Cross-Validation
+```{r}
+# Perform cross-validation to find optimal number of rounds
+set.seed(123)
+
+xgb_cv <- xgb.cv(
+  params = params,
+  data = dtrain,
+  nrounds = 1000,
+  nfold = 5,
+  early_stopping_rounds = 50,
+  verbose = 1,
+  maximize = TRUE     # AUC must be maximized
+)
+#Ploting Cross-Validation Results
+cv_log <- xgb_cv$evaluation_log
+
+plot(cv_log$iter, cv_log$test_auc_mean,
+     type = "l", col = "blue",
+     xlab = "Number of rounds",
+     ylab = "AUC",
+     main = "Cross-Validation AUC")
+
+lines(cv_log$iter, cv_log$train_auc_mean, col = "red")
+
+legend("bottomright",
+       legend = c("Test AUC", "Train AUC"),
+       col = c("blue","red"),
+       lty = 1)
+#Get Optimal Number of Rounds
+best_nrounds <- xgb_cv$best_iteration
+cat("Best number of rounds:", best_nrounds, "\n")
+# Check best iteration from CV
+best_nrounds <- xgb_cv$best_iteration
+
+# Fallback if best_nrounds is NULL
+if(is.null(best_nrounds) || best_nrounds <= 0){
+  cat("best_nrounds is invalid, setting to default 100\n")
+  best_nrounds <- 100
+} else {
+  cat("Best number of rounds from CV:", best_nrounds, "\n")
+}
+
+# Training the final model
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = best_nrounds,
+  watchlist = list(train = dtrain, test = dtest),
+  verbose = 1,
+  maximize = TRUE  # ensures metrics like AUC are maximized
+)
+```
+Step 10: Hyperparameter Tuning
+```{r}
+library(doParallel)
+library(foreach)
+# Register cores
+registerDoParallel(cores = 4)
+
+# Parameter grid
+param_grid <- expand.grid(
+  max_depth = c(4,6,8),
+  eta = c(0.01,0.1,0.3),
+  subsample = c(0.7,0.8,0.9),
+  colsample_bytree = c(0.7,0.8,0.9)
+)
+
+# Grid search using parallel processing
+results <- foreach(
+  i = 1:nrow(param_grid),
+  .combine = rbind,
+  .packages = "xgboost",
+  .export = c("X_train","y_train")
+) %dopar% {
+
+  # Recreate DMatrix INSIDE worker
+  dtrain_local <- xgb.DMatrix(data = X_train, label = y_train)
+
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    max_depth = param_grid$max_depth[i],
+    eta = param_grid$eta[i],
+    subsample = param_grid$subsample[i],
+    colsample_bytree = param_grid$colsample_bytree[i]
+  )
+
+  cv <- xgb.cv(
+    params = params,
+    data = dtrain_local,
+    nrounds = 500,
+    nfold = 3,
+    early_stopping_rounds = 20,
+    verbose = 0,
+    maximize = TRUE
+  )
+
+  auc <- max(cv$evaluation_log$test_auc_mean)
+
+  data.frame(param_grid[i,], auc = auc)
+}
+
+# Best parameters
+best_params <- results[which.max(results$auc),]
+
+print(best_params)
+```
+
+
+Step 11: Make Predictions and Evaluate
+```{r}
+# Predict on test set
+predictions <- predict(xgb_model, dtest)
+
+# Convert probabilities to binary predictions (threshold = 0.5)
+predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+
+# Confusion matrix
+confusionMatrix(as.factor(predicted_classes), as.factor(y_test))
+
+# Calculate metrics
+# Precision, Recall, F1 Score
+precision <- posPredValue(as.factor(predicted_classes), as.factor(y_test))
+recall <- sensitivity(as.factor(predicted_classes), as.factor(y_test))
+f1 <- (2 * precision * recall) / (precision + recall)
+
+cat("Precision:", precision, "\n")
+cat("Recall:", recall, "\n")
+cat("F1 Score:", f1, "\n")
+
+# ROC Curve and AUC
+pred <- prediction(predictions, y_test)
+perf <- performance(pred, "tpr", "fpr")
+plot(perf, col = "blue", main = "ROC Curve")
+abline(0, 1, lty = 2, col = "gray")
+
+auc <- performance(pred, "auc")@y.values[[1]]
+cat("AUC:", auc, "\n")
+
+# Precision-Recall curve (as mentioned in your proposal)
+pr_perf <- performance(pred, "prec", "rec")
+plot(pr_perf, col = "blue", main = "Precision-Recall Curve")
+```
+
+Step 12: Feature Importance Analysis
+```{r}
+# Feature importance
+importance_matrix <- xgb.importance(
+  model = xgb_model,
+  feature_names = colnames(X_train)
+)
+
+# Plot feature importance
+xgb.plot.importance(
+  importance_matrix,
+  top_n = 20,
+  main = "Top 20 Feature Importance"
+)
+
+# SHAP analysis
+library(SHAPforxgboost)
+
+# Prepare SHAP values directly from model
+shap_long <- shap.prep(
+  xgb_model = xgb_model,
+  X_train = as.data.frame(X_train)
+)
+
+# SHAP summary plot
+shap.plot.summary(shap_long)
+```
+
+
+Step 13: Threshold Optimization for Fraud Detection
+```{r}
+# Find optimal threshold based on F1 score
+thresholds <- seq(0.1, 0.9, by = 0.01)
+f1_scores <- numeric(length(thresholds))
+
+for(i in 1:length(thresholds)) {
+  pred_class <- ifelse(predictions > thresholds[i], 1, 0)
+  precision <- posPredValue(as.factor(pred_class), as.factor(y_test))
+  recall <- sensitivity(as.factor(pred_class), as.factor(y_test))
+  f1_scores[i] <- (2 * precision * recall) / (precision + recall)
+}
+
+optimal_threshold <- thresholds[which.max(f1_scores)]
+cat("Optimal threshold:", optimal_threshold, "\n")
+
+# Plot F1 vs threshold
+plot(thresholds, f1_scores, type = "l", 
+     xlab = "Threshold", ylab = "F1 Score",
+     main = "F1 Score vs Threshold")
+abline(v = optimal_threshold, col = "red", lty = 2)
+```
+
+Step 14: Save the Model for Later Use
+```{r}
+# Save the model
+xgb.save(xgb_model, "xgboost_fraud_model.json")
+
+# Save important objects
+saveRDS(list(
+  model = xgb_model,
+  features = colnames(X_train),
+  optimal_threshold = optimal_threshold,
+  importance = importance_matrix
+), file = "fraud_model_artifacts.rds")
+```
+
+STEP 15: Generate Out-of-Fold Predictions for Ensemble
+```{r}
+# Ensure the entire dataset is numeric BEFORE cross-validation
+X_balanced_matrix <- as.matrix(X_balanced_matrix)
+storage.mode(X_balanced_matrix) <- "numeric"
+
+# Replace problematic values
+X_balanced_matrix[is.na(X_balanced_matrix)] <- 0
+X_balanced_matrix[is.infinite(X_balanced_matrix)] <- 0
+
+# Ensure target is numeric
+y_balanced <- as.numeric(y_balanced)
+
+# Load model
+xgb_model <- xgb.load("xgboost_fraud_model.json")
+
+# Test predictions
+xgb_test_predictions <- predict(xgb_model, dtest)
+
+set.seed(456)
+n_folds <- 5
+folds <- createFolds(y_balanced, k = n_folds, list = TRUE)
+
+# Initialize OOF predictions
+xgb_oof_predictions <- numeric(length(y_balanced))
+
+for(i in 1:n_folds){
+
+  cat("Processing fold", i, "...\n")
+
+  val_indices <- folds[[i]]
+  train_indices <- setdiff(seq_along(y_balanced), val_indices)
+
+  # Split data
+  X_train_fold <- X_balanced_matrix[train_indices, , drop = FALSE]
+  X_val_fold   <- X_balanced_matrix[val_indices, , drop = FALSE]
+
+  y_train_fold <- y_balanced[train_indices]
+
+  # Force numeric storage again (safety)
+  storage.mode(X_train_fold) <- "numeric"
+  storage.mode(X_val_fold) <- "numeric"
+
+  # Create DMatrix
+  dtrain_fold <- xgb.DMatrix(data = X_train_fold, label = y_train_fold)
+  dval_fold   <- xgb.DMatrix(data = X_val_fold)
+
+  # Train model
+  model_fold <- xgb.train(
+    params = params,
+    data = dtrain_fold,
+    nrounds = best_nrounds,
+    verbose = 0
+  )
+
+  # Predict validation fold
+  xgb_oof_predictions[val_indices] <- predict(model_fold, dval_fold)
+}
+
+# Save predictions
+saveRDS(xgb_oof_predictions, "xgb_oof_predictions.rds")
+saveRDS(xgb_test_predictions, "xgb_test_predictions.rds")
+saveRDS(y_balanced, "ensemble_target.rds")
+
+cat("✓ Out-of-fold predictions saved for ensemble building\n")
+```
+
+Step 16: Allignment with original data
+```{r}
+# After generating xgb_oof_predictions on balanced data map back to original dataset indices
+
+# Create mapping from balanced indices to original rows
+original_indices <- which(y == 1 | y == 0)  
+balanced_to_original <- rep(NA, length(y_balanced))
+
+# For each balanced sample, track original index
+balanced_to_original <- rep(NA, length(y_balanced))
+
+# Assuming SMOTE keeps original rows first then adds synthetic
+n_original <- length(y)
+balanced_to_original[1:n_original] <- 1:n_original
+# Synthetic rows get NA (will be removed later)
+
+# Create aligned predictions
+xgb_oof_aligned <- rep(NA, nrow(df))
+xgb_oof_aligned[balanced_to_original[!is.na(balanced_to_original)]] <- 
+  xgb_oof_predictions[!is.na(balanced_to_original)]
+
+# Save aligned predictions
+saveRDS(xgb_oof_aligned, "xgb_oof_aligned.rds")
+```
+
+
+

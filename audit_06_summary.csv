@@ -1,0 +1,5 @@
+,Reported,Saved predictions,Leak-free rebuild
+XGBoost,0.92,0.498,0.499
+LSTM (text),0.9,1.0,0.496
+GNN (network),0.88,0.499,0.503
+Stacked ensemble,0.96,1.0,0.496

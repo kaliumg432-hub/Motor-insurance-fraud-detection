@@ -1,0 +1,337 @@
+---
+title: "LSTM Fraud Detection - Restructured"
+author: "John Munyaka"
+output: html_document
+---
+
+Step 0: Load Packages and Environment
+```{r setup, message=FALSE, warning=FALSE}
+library(pacman)
+pacman::p_load(
+  tidyverse,
+  caret,
+  pROC,
+  PRROC,
+  keras3,
+  tensorflow
+)
+
+set.seed(42)
+tensorflow::set_random_seed(42)
+
+```
+
+
+Step 1: Load data
+```{r} 
+df <- read.csv("C:/Users/USER/Desktop/data_set_2_kaggle.csv", stringsAsFactors = FALSE)
+
+str(df)
+dim(df)
+
+# Target
+df$FraudFound <- ifelse(df$FraudFound == "Yes", 1, 0)
+table(df$FraudFound)
+prop.table(table(df$FraudFound))
+```
+
+Step 2: Build label-neutral synthetic claim narratives
+```{r}
+make_narrative <- function(row) {
+  paste(
+    "Claim filed for a", row[["Make"]],
+    row[["VehicleCategory"]], 
+    "under", row[["BasePolicy"]], "policy.",
+    "Accident area:", row[["AccidentArea"]], ".",
+    "Driver age:", row[["Age"]], ".",
+    "Driver sex:", row[["Sex"]], ".",
+    "Marital status:", row[["MaritalStatus"]], ".",
+    "Fault category:", row[["Fault"]], ".",
+    "Claim amount:", row[["ClaimAmount"]], ".",
+    "Vehicle price:", row[["VehiclePrice"]], ".",
+    "Deductible:", row[["Deductible"]], ".",
+    "Driver rating:", row[["DriverRating"]], ".",
+    "Past claims:", row[["PastNumberOfClaims"]], ".",
+    "Police report filed:", row[["PoliceReportFiled"]], ".",
+    "Witness present:", row[["WitnessPresent"]], ".",
+    "Agent type:", row[["AgentType"]], ".",
+    "Number of supplements:", row[["NumberOfSuppliments"]], ".",
+    "Address change claim:", row[["AddressChange.Claim"]], ".",   # ✅ FIXED
+    "Number of cars:", row[["NumberOfCars"]], ".",
+    "Month of accident:", row[["Month"]], ".",
+    "Week of month:", row[["WeekOfMonth"]], ".",
+    "Day of week:", row[["DayOfWeek"]], ".",
+    "Month claimed:", row[["MonthClaimed"]], ".",
+    "Week claimed:", row[["WeekOfMonthClaimed"]], ".",
+    "Days policy accident:", row[["Days.Policy.Accident"]], ".",  # ✅ FIXED
+    "Days policy claim:", row[["Days.Policy.Claim"]], "."         # ✅ FIXED
+  )
+}
+
+df$claim_narrative <- apply(df, 1, make_narrative)
+
+head(df$claim_narrative, 3)
+```
+
+
+Step 3: Train/test split BEFORE tokenization
+```{r}
+train_index <- createDataPartition(df$FraudFound, p = 0.8, list = FALSE)
+
+train_df <- df[train_index, ]
+test_df  <- df[-train_index, ]
+
+y_train <- train_df$FraudFound
+y_test  <- test_df$FraudFound
+
+table(y_train)
+table(y_test)
+```
+
+Step 4: Tokenize text using training set only
+```{r}
+library(keras3)
+
+max_words <- 10000
+max_len   <- 80
+
+# Create vectorization layer
+vectorizer <- layer_text_vectorization(
+  max_tokens = max_words,
+  output_mode = "int",
+  output_sequence_length = max_len
+)
+
+# Learn vocabulary from TRAIN data ONLY
+adapt(vectorizer, train_df$claim_narrative)
+
+# Convert text → integer sequences
+X_text_train <- vectorizer(train_df$claim_narrative)
+X_text_test  <- vectorizer(test_df$claim_narrative)
+
+# Convert tensors → arrays
+X_text_train <- as.array(X_text_train)
+X_text_test  <- as.array(X_text_test)
+
+dim(X_text_train)
+dim(X_text_test)
+```
+Step 5: Class weights for imbalance
+
+```{r}
+n_train <- length(y_train)
+n_neg <- sum(y_train == 0)
+n_pos <- sum(y_train == 1)
+
+class_weights <- list(
+  "0" = n_train / (2 * n_neg),
+  "1" = n_train / (2 * n_pos)
+)
+
+class_weights
+```
+Step 6: Build LSTM model
+```{r}
+build_lstm_model <- function(max_words = 10000, max_len = 80, embedding_dim = 64, lstm_units = 32) {
+  
+  model <- keras_model_sequential() %>%
+    layer_embedding(
+      input_dim = max_words,
+      output_dim = embedding_dim,
+      input_length = max_len
+    ) %>%
+    layer_spatial_dropout_1d(rate = 0.2) %>%
+    layer_lstm(units = lstm_units, dropout = 0.2, recurrent_dropout = 0.2) %>%
+    layer_dense(units = 16, activation = "relu") %>%
+    layer_dropout(rate = 0.2) %>%
+    layer_dense(units = 1, activation = "sigmoid")
+  
+  model %>% compile(
+    optimizer = optimizer_adam(learning_rate = 0.001),
+    loss = "binary_crossentropy",
+    metrics = list(
+      metric_precision(name = "precision"),
+      metric_recall(name = "recall"),
+      metric_auc(name = "auc")
+    )
+  )
+  
+  model
+}
+
+lstm_model <- build_lstm_model(max_words, max_len)
+summary(lstm_model)
+```
+Step 7: Train model
+```{r}
+callbacks_list <- list(
+  callback_early_stopping(
+    monitor = "val_loss",
+    patience = 4,
+    restore_best_weights = TRUE
+  ),
+  callback_reduce_lr_on_plateau(
+    monitor = "val_loss",
+    factor = 0.5,
+    patience = 2
+  )
+)
+
+history <- lstm_model %>% fit(
+  x = X_text_train,
+  y = y_train,
+  epochs = 15,
+  batch_size = 256,
+  validation_split = 0.2,
+  class_weight = class_weights,
+  callbacks = callbacks_list,
+  verbose = 1
+)
+
+plot(history)
+```
+
+Step 8: Evaluate model
+```{r}
+y_pred_prob <- as.numeric(predict(lstm_model, X_text_test))
+y_pred_class <- ifelse(y_pred_prob >= 0.5, 1, 0)
+
+conf_mat <- confusionMatrix(
+  factor(y_pred_class, levels = c(0,1)),
+  factor(y_test, levels = c(0,1)),
+  positive = "1"
+)
+
+print(conf_mat)
+
+precision <- conf_mat$byClass["Pos Pred Value"]
+recall    <- conf_mat$byClass["Sensitivity"]
+f1_score  <- 2 * precision * recall / (precision + recall)
+
+roc_obj <- roc(y_test, y_pred_prob)
+roc_auc <- as.numeric(auc(roc_obj))
+
+pr_obj <- pr.curve(
+  scores.class0 = y_pred_prob[y_test == 1],
+  scores.class1 = y_pred_prob[y_test == 0],
+  curve = TRUE
+)
+
+cat("Precision:", round(precision, 4), "\n")
+cat("Recall:", round(recall, 4), "\n")
+cat("F1 Score:", round(f1_score, 4), "\n")
+cat("ROC-AUC:", round(roc_auc, 4), "\n")
+cat("PR-AUC:", round(pr_obj$auc.integral, 4), "\n")
+```
+
+Step 9: Save model and test predictions
+```{r}
+# Create folders if they do not exist
+if (!dir.exists("models")) dir.create("models")
+if (!dir.exists("predictions")) dir.create("predictions")
+
+# Save model
+save_model(lstm_model, "models/lstm_fraud_model.keras")
+
+# Save predictions
+saveRDS(y_pred_prob, "predictions/lstm_test_predictions.rds")
+saveRDS(y_test, "predictions/lstm_y_test.rds")
+```
+
+Step 10: Generate out-of-fold predictions for ensemble
+```{r}
+generate_lstm_oof <- function(texts, y, n_folds = 5, max_words = 10000, max_len = 80) {
+  
+  set.seed(456)
+  folds <- createFolds(y, k = n_folds, list = TRUE)
+  oof_pred <- numeric(length(y))
+  
+  for (i in seq_along(folds)) {
+    cat("Fold:", i, "\n")
+    
+    val_idx <- folds[[i]]
+    tr_idx <- setdiff(seq_along(y), val_idx)
+    
+    tr_text <- texts[tr_idx]
+    val_text <- texts[val_idx]
+    y_tr <- y[tr_idx]
+    
+    # ✅ Create vectorizer for THIS fold
+    vectorizer <- layer_text_vectorization(
+      max_tokens = max_words,
+      output_mode = "int",
+      output_sequence_length = max_len
+    )
+    
+    # ✅ Fit ONLY on training text
+    adapt(vectorizer, tr_text)
+    
+    # ✅ Transform text → sequences
+    X_tr  <- as.array(vectorizer(tr_text))
+    X_val <- as.array(vectorizer(val_text))
+    
+    # Class weights
+    n_tr <- length(y_tr)
+    cw <- list(
+      "0" = n_tr / (2 * sum(y_tr == 0)),
+      "1" = n_tr / (2 * sum(y_tr == 1))
+    )
+    
+    # Build model
+    model <- build_lstm_model(max_words, max_len)
+    
+    # Train
+    model %>% fit(
+      X_tr, y_tr,
+      epochs = 10,
+      batch_size = 256,
+      validation_split = 0.1,
+      class_weight = cw,
+      callbacks = list(
+        callback_early_stopping(
+          monitor = "val_loss",
+          patience = 3,
+          restore_best_weights = TRUE
+        )
+      ),
+      verbose = 0
+    )
+    
+    # Predict
+    oof_pred[val_idx] <- as.numeric(predict(model, X_val))
+  }
+  
+  return(oof_pred)
+}
+```
+#Summary- OOF Predictions
+```{r}
+lstm_oof_predictions <- generate_lstm_oof(df$claim_narrative, df$FraudFound)
+
+summary(lstm_oof_predictions) 
+```
+#Saving the predictions
+```{r}
+# Create folders safely
+dir.create("predictions", showWarnings = FALSE)
+dir.create("models", showWarnings = FALSE)
+
+# Save files
+saveRDS(lstm_oof_predictions, "predictions/lstm_oof_predictions.rds")
+saveRDS(df$FraudFound, "predictions/y_full.rds")
+saveRDS(y_pred_prob, "predictions/lstm_test_predictions.rds")
+```
+
+```{r}
+sum(is.na(lstm_oof_predictions))
+length(lstm_oof_predictions)
+```
+
+```{r}
+plot(pr_obj)
+```
+
+
+
+ 
+ 

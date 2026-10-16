@@ -1,0 +1,6 @@
+,value
+proxy_rate,0.058
+benchmark_auc_rule_columns,0.9998
+benchmark_auc_without_rule_columns,0.4319
+project_ensemble_auc,0.5561
+project_ensemble_f1,0.0952

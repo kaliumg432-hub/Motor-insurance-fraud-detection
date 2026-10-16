@@ -1,0 +1,6 @@
+,value
+saved_oof_on_smote_rows,0.7507
+saved_after_mapping,0.4979
+label_agreement,0.4598
+repro_smote_before_split,0.7853
+repro_smote_inside_folds,0.5005
