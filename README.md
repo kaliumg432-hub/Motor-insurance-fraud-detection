@@ -132,7 +132,7 @@ Each script prints its numbers and writes an `audit_0X_results.csv`. Seeds are f
 
 The two CSV files aren't included in this repository, because I couldn't confirm their source or licence:
 
-- **`data_set_2_kaggle.csv`** (150,000 rows) uses the column layout of the public Kaggle vehicle-claim fraud dataset (`fraud_oracle`, 15,420 claims). Its values appear randomised.
+- **`data_set_2_kaggle.csv`** (150,000 rows) uses the column layout of the public Kaggle vehicle-claim fraud dataset (`fraud_oracle`, 15,420 claims). Its values appear randomised. It was downloaded from Kaggle around February 2026, and the exact page wasn't recorded.
 - **`Kenyan_Motor_Insurance_2023_2024.csv`** (2,000 rows) is a simulated dataset.
 
 If you have them, place them next to the scripts. The `saved_*.rds` files are the project's own saved predictions and are included, so `audit_06_summary_chart.py` runs without either CSV.
